@@ -1,0 +1,393 @@
+# ============================================================
+# OCR_BHS PROJECT - CENTRAL CONFIGURATION
+# ============================================================
+
+project:
+  name: "OCR_BHS"
+  version: "1.0.0"
+  environment: "development"
+  log_level: "INFO"
+
+
+# ============================================================
+# CAMERAS
+# ============================================================
+
+cameras:
+
+  camera_1:
+    enabled: true
+    source_type: "rtsp"
+    source_env: "CAMERA_1_RTSP"
+    name: "Camera 1"
+    reconnect: true
+    reconnect_delay: 2
+    buffer_size: 1
+    target_fps: 0
+
+  camera_2:
+    enabled: false
+    source_type: "rtsp"
+    source_env: "CAMERA_2_RTSP"
+    name: "Camera 2"
+    reconnect: true
+    reconnect_delay: 2
+    buffer_size: 1
+    target_fps: 0
+
+  camera_3:
+    enabled: false
+    source_type: "rtsp"
+    source_env: "CAMERA_3_RTSP"
+    name: "Camera 3"
+    reconnect: true
+    reconnect_delay: 2
+    buffer_size: 1
+    target_fps: 0
+
+  camera_4:
+    enabled: false
+    source_type: "rtsp"
+    source_env: "CAMERA_4_RTSP"
+    name: "Camera 4"
+    reconnect: true
+    reconnect_delay: 2
+    buffer_size: 1
+    target_fps: 0
+
+
+# ============================================================
+# DETECTION
+# ============================================================
+
+detection:
+
+  model:
+    path: "models/yolo/yolo26n.pt"
+    confidence: 0.30
+    image_size: 640
+    device: "cpu"
+    half: false
+
+  classes:
+    tag: 0
+
+  inference:
+    max_detections: 100
+    agnostic_nms: false
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+preprocessing:
+
+  crop:
+    enabled: true
+    padding: 10
+    min_width: 20
+    min_height: 20
+
+  image_quality:
+    enabled: true
+    min_score: 40.0
+    blur_threshold: 50.0
+    brightness_min: 30.0
+    brightness_max: 230.0
+
+  resize:
+    enabled: true
+    width: 640
+    height: 640
+
+
+# ============================================================
+# TRACKING
+# ============================================================
+
+tracking:
+
+  enabled: true
+
+  tracker: "bytetrack"
+
+  track_high_thresh: 0.50
+  track_low_thresh: 0.10
+  new_track_thresh: 0.60
+
+  track_buffer: 30
+  match_thresh: 0.80
+
+  fuse_score: true
+
+  min_hits: 3
+
+  prediction_buffer: 5
+  max_jump_distance: 200
+
+  min_iou_warning: 0.10
+  unstable_frame_threshold: 5
+
+  min_bbox_area: 100
+  min_track_confidence: 0.30
+
+
+# ============================================================
+# BARCODE
+# Existing barcode_engine.py and barcode_region_processor.py
+# ============================================================
+
+barcode:
+
+  enabled: true
+
+  engine: "pyzbar"
+
+  formats:
+    - "CODE128"
+
+  processing:
+    rotations:
+      - 0
+      - 90
+      - 180
+      - 270
+
+    preprocessing: true
+
+  worker:
+    enabled: true
+    count: 2
+    queue_size: 50
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+ocr:
+
+  enabled: true
+
+  engine: "paddle"
+
+  languages:
+    - "en"
+
+  processing:
+    rotations:
+      - 0
+      - 90
+      - 180
+      - 270
+
+  worker:
+    enabled: true
+    count: 2
+    queue_size: 50
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+validation:
+
+  enabled: true
+
+  iata:
+    enabled: true
+
+    # Example:
+    # ABC1234567
+    min_length: 3
+    max_length: 20
+
+  barcode_ocr:
+    require_barcode: false
+    require_ocr: false
+
+    agreement_required: false
+
+
+# ============================================================
+# BACKGROUND PROCESSING
+# ============================================================
+
+processing:
+
+  asynchronous: true
+
+  queue:
+    max_size: 100
+
+  best_frame:
+    enabled: true
+
+    frames_per_track: 5
+    minimum_quality_score: 40.0
+
+  duplicate_processing:
+    enabled: true
+    process_once_per_track: true
+
+
+# ============================================================
+# WORKERS
+# ============================================================
+
+workers:
+
+  barcode:
+    enabled: true
+    count: 2
+
+  ocr:
+    enabled: true
+    count: 2
+
+  validation:
+    enabled: true
+    count: 1
+
+  result:
+    enabled: true
+    count: 1
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+
+pipeline:
+
+  mode: "live"
+
+  continuous_detection: true
+  continuous_tracking: true
+
+  asynchronous_ocr: true
+  asynchronous_barcode: true
+
+  stop_on_camera_failure: false
+
+  graceful_shutdown_timeout: 10
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+database:
+
+  enabled: false
+
+  type: "sqlserver"
+
+  host_env: "DB_HOST"
+  port: 1433
+  database_env: "DB_NAME"
+  username_env: "DB_USERNAME"
+  password_env: "DB_PASSWORD"
+
+  connection_timeout: 10
+
+  insert_results: true
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+paths:
+
+  models: "models"
+  captures: "captures"
+  raw_captures: "captures/raw"
+  tag_captures: "captures/tags"
+  barcode_captures: "captures/barcode"
+  ocr_captures: "captures/ocr"
+
+  failed: "failed"
+  failed_detection: "failed/detection"
+  failed_barcode: "failed/barcode"
+  failed_ocr: "failed/ocr"
+  failed_validation: "failed/validation"
+
+  output: "output"
+  output_detections: "output/detections"
+  output_tracking: "output/tracking"
+  output_barcode: "output/barcode"
+  output_ocr: "output/ocr"
+  output_validation: "output/validation"
+  output_logs: "output/logs"
+
+  videos_input: "videos/input"
+  videos_output: "videos/output"
+
+  logs: "logs"
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+debug:
+
+  enabled: true
+
+  save_frames: false
+  save_detection_frames: false
+  save_tracking_frames: false
+  save_failed_frames: true
+
+  display_window: false
+
+  video_test:
+    enabled: false
+    source: "videos/input/test_video.mp4"
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+
+performance:
+
+  frame_queue_size: 2
+
+  drop_old_frames: true
+
+  shared_model: true
+
+  max_camera_threads: 4
+
+  measure_fps: true
+  measure_latency: true
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging:
+
+  enabled: true
+
+  console: true
+  file: true
+
+  directory: "logs"
+
+  files:
+    application: "logs/application/application.log"
+    camera: "logs/camera/camera.log"
+    detection: "logs/detection/detection.log"
+    ocr: "logs/ocr/ocr.log"
+    database: "logs/database/database.log"
+
+  rotation:
+    enabled: true
+    max_size_mb: 10
+    backup_count: 5
