@@ -6,6 +6,7 @@ Features:
     - Recorded video support
     - Automatic reconnect
     - Video looping
+    - Source-FPS-aware video playback
     - Low-latency latest-frame buffer
     - Continuous background capture
     - Multi-camera CameraManager
@@ -21,6 +22,7 @@ from __future__ import annotations
 import os
 import time
 import threading
+
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Iterator, Any
@@ -84,10 +86,17 @@ class Camera:
 
     The camera capture runs in a background thread.
 
+    For RTSP:
+        The camera stream controls the natural frame timing.
+
+    For recorded video:
+        The source FPS is respected automatically when
+        target_fps is 0.
+
     buffer_size=1 means:
         Only the newest frame is retained.
 
-    This is preferred for real-time RTSP processing because
+    This is preferred for real-time processing because
     downstream processing should not consume old frames.
     """
 
@@ -174,12 +183,23 @@ class Camera:
         if self.buffer_size < 1:
             self.buffer_size = 1
 
+        # ----------------------------------------------------
+        # target_fps
+        #
+        # 0 means:
+        #     For video -> use source FPS
+        #     For RTSP  -> don't artificially throttle
+        # ----------------------------------------------------
+
         self.target_fps = float(
             camera_config.get(
                 "target_fps",
                 0,
             )
         )
+
+        if self.target_fps < 0:
+            self.target_fps = 0.0
 
         self.video_loop = bool(
             camera_config.get(
@@ -249,6 +269,19 @@ class Camera:
 
         self.video_eof = False
 
+        # ----------------------------------------------------
+        # Video timing
+        # ----------------------------------------------------
+
+        self.video_frame_interval = 0.0
+
+        self.video_next_frame_time = 0.0
+
+        # Used to prevent a bad FPS value from creating
+        # an unusably slow playback.
+        self.min_video_fps = 1.0
+        self.max_video_fps = 240.0
+
     # ========================================================
     # SOURCE
     # ========================================================
@@ -271,7 +304,6 @@ class Camera:
         if self.source_type == "rtsp":
 
             if not self.source_env:
-
                 raise ValueError(
                     f"[{self.camera_id}] "
                     "source_env is empty."
@@ -289,7 +321,6 @@ class Camera:
             ).strip()
 
             if not source:
-
                 raise ValueError(
                     f"[{self.camera_id}] "
                     f"Environment variable "
@@ -305,7 +336,6 @@ class Camera:
         if self.source_type == "video":
 
             if not self.video_source:
-
                 raise ValueError(
                     f"[{self.camera_id}] "
                     "video_source is empty."
@@ -327,7 +357,6 @@ class Camera:
             )
 
             if not os.path.exists(source):
-
                 raise FileNotFoundError(
                     f"[{self.camera_id}] "
                     f"Video file not found:\n"
@@ -346,6 +375,172 @@ class Camera:
             f"'{self.source_type}'. "
             f"Use 'rtsp' or 'video'."
         )
+
+    # ========================================================
+    # VIDEO TIMING SETUP
+    # ========================================================
+
+    def _configure_video_timing(self) -> None:
+        """
+        Configure playback timing for recorded video.
+
+        Rules:
+
+            target_fps > 0
+                Use configured target FPS.
+
+            target_fps == 0
+                Use video's native FPS.
+
+        Example:
+
+            source FPS = 60.01
+
+            interval =
+                1 / 60.01
+                ≈ 0.01666 sec
+        """
+
+        if self.source_type != "video":
+            self.video_frame_interval = 0.0
+            self.video_next_frame_time = 0.0
+            return
+
+        # ----------------------------------------------------
+        # Determine effective FPS
+        # ----------------------------------------------------
+
+        if self.target_fps > 0:
+
+            effective_fps = self.target_fps
+
+        else:
+
+            effective_fps = self.source_fps
+
+        # ----------------------------------------------------
+        # Validate FPS
+        # ----------------------------------------------------
+
+        if (
+            effective_fps < self.min_video_fps
+            or effective_fps > self.max_video_fps
+        ):
+
+            print(
+                f"[{self.camera_id}] "
+                f"Warning: invalid video FPS "
+                f"{effective_fps:.2f}. "
+                f"Using 30 FPS."
+            )
+
+            effective_fps = 30.0
+
+        # ----------------------------------------------------
+        # Calculate frame interval
+        # ----------------------------------------------------
+
+        self.video_frame_interval = (
+            1.0 / effective_fps
+        )
+
+        # First frame should be read immediately.
+        self.video_next_frame_time = (
+            time.monotonic()
+        )
+
+        print(
+            f"[{self.camera_id}] "
+            f"Video playback FPS: "
+            f"{effective_fps:.2f} | "
+            f"Frame interval: "
+            f"{self.video_frame_interval * 1000:.2f} ms"
+        )
+
+    # ========================================================
+    # VIDEO PACING
+    # ========================================================
+
+    def _wait_for_video_frame_time(self) -> None:
+        """
+        Pace recorded video playback.
+
+        This is intentionally used ONLY for recorded video.
+
+        RTSP streams are not artificially delayed.
+        """
+
+        if self.source_type != "video":
+            return
+
+        if self.video_frame_interval <= 0:
+            return
+
+        now = time.monotonic()
+
+        # ----------------------------------------------------
+        # First frame
+        # ----------------------------------------------------
+
+        if self.video_next_frame_time <= 0:
+
+            self.video_next_frame_time = now
+
+        # ----------------------------------------------------
+        # Wait until scheduled frame time
+        # ----------------------------------------------------
+
+        wait_time = (
+            self.video_next_frame_time
+            - now
+        )
+
+        if wait_time > 0:
+
+            # Sleep most of the wait.
+            #
+            # The tiny remaining amount is handled by
+            # another loop iteration.
+            if wait_time > 0.002:
+
+                time.sleep(
+                    wait_time - 0.001
+                )
+
+            while (
+                not self.stop_event.is_set()
+                and
+                time.monotonic()
+                < self.video_next_frame_time
+            ):
+                time.sleep(0.0005)
+
+        # ----------------------------------------------------
+        # Schedule next frame
+        # ----------------------------------------------------
+
+        self.video_next_frame_time += (
+            self.video_frame_interval
+        )
+
+        # ----------------------------------------------------
+        # Recover from long processing delays
+        # ----------------------------------------------------
+
+        now = time.monotonic()
+
+        if (
+            self.video_next_frame_time
+            < now - (
+                self.video_frame_interval * 2
+            )
+        ):
+
+            self.video_next_frame_time = (
+                now
+                +
+                self.video_frame_interval
+            )
 
     # ========================================================
     # OPEN CAPTURE
@@ -386,10 +581,12 @@ class Camera:
 
                 # Low-latency buffer.
                 try:
+
                     self.cap.set(
                         cv2.CAP_PROP_BUFFERSIZE,
                         1,
                     )
+
                 except Exception:
                     pass
 
@@ -453,16 +650,41 @@ class Camera:
                 )
             )
 
-            # Some RTSP streams report 0 FPS.
+            # ------------------------------------------------
+            # FPS handling
+            # ------------------------------------------------
+
             if self.source_fps <= 0:
 
-                self.source_fps = 25.0
+                if self.source_type == "video":
+
+                    print(
+                        f"[{self.camera_id}] "
+                        "Video source did not report FPS. "
+                        "Using 30 FPS."
+                    )
+
+                    self.source_fps = 30.0
+
+                else:
+
+                    self.source_fps = 25.0
+
+            # ------------------------------------------------
+            # Connection state
+            # ------------------------------------------------
 
             self.connected = True
 
             self.video_eof = False
 
             self.last_error = None
+
+            # ------------------------------------------------
+            # Configure recorded-video pacing
+            # ------------------------------------------------
+
+            self._configure_video_timing()
 
             print(
                 f"[{self.camera_id}] "
@@ -496,7 +718,9 @@ class Camera:
     # RELEASE
     # ========================================================
 
-    def _release_capture(self) -> None:
+    def _release_capture(
+        self,
+    ) -> None:
         """
         Safely release VideoCapture.
         """
@@ -515,6 +739,60 @@ class Camera:
         self.connected = False
 
     # ========================================================
+    # LOOP RECORDED VIDEO
+    # ========================================================
+
+    def _restart_video_from_beginning(self) -> bool:
+        """
+        Restart recorded video from frame 0.
+
+        This uses OpenCV seek instead of destroying and reopening
+        the VideoCapture object.
+
+        This is faster and avoids unnecessary reconnect cycles.
+        """
+
+        if self.cap is None:
+            return False
+
+        try:
+
+            # Seek to first frame.
+            success = self.cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                0,
+            )
+
+            # Reset timing.
+            self.video_eof = False
+
+            self.video_next_frame_time = (
+                time.monotonic()
+                +
+                self.video_frame_interval
+            )
+
+            # Some backends return False even though seeking
+            # succeeds. Verify by checking the current frame.
+            current_position = self.cap.get(
+                cv2.CAP_PROP_POS_FRAMES
+            )
+
+            if success or current_position <= 1:
+
+                self.connected = True
+
+                return True
+
+        except Exception as exc:
+
+            self.last_error = str(
+                exc
+            )
+
+        return False
+
+    # ========================================================
     # START
     # ========================================================
 
@@ -523,8 +801,9 @@ class Camera:
         Start the camera.
 
         Returns:
-            True  -> camera connected and thread started
-            False -> initial connection failed
+
+            True  -> camera thread started
+            False -> camera could not be started
         """
 
         if not self.enabled:
@@ -571,6 +850,12 @@ class Camera:
         self.running = True
 
         self.start_time = time.time()
+
+        self.last_fps_time = time.time()
+
+        self.fps_frame_count = 0
+
+        self.current_fps = 0.0
 
         self.capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -619,6 +904,12 @@ class Camera:
     def _capture_loop(self) -> None:
         """
         Background capture loop.
+
+        RTSP:
+            Read continuously from live stream.
+
+        Video:
+            Read at source/target FPS.
         """
 
         while not self.stop_event.is_set():
@@ -640,6 +931,42 @@ class Camera:
 
                     continue
 
+                # ------------------------------------------------
+                # For recorded video, try seek/restart first.
+                # ------------------------------------------------
+
+                if self.source_type == "video":
+
+                    if self.video_loop:
+
+                        if self._restart_video_from_beginning():
+
+                            continue
+
+                    # If seeking failed, reopen.
+                    self.reconnect_count += 1
+
+                    print(
+                        f"[{self.camera_id}] "
+                        f"Reopening video "
+                        f"(attempt "
+                        f"{self.reconnect_count})..."
+                    )
+
+                    if not self._open():
+
+                        time.sleep(
+                            self.reconnect_delay
+                        )
+
+                        continue
+
+                    continue
+
+                # ------------------------------------------------
+                # RTSP reconnect
+                # ------------------------------------------------
+
                 self.reconnect_count += 1
 
                 print(
@@ -658,6 +985,23 @@ class Camera:
                     continue
 
             # ------------------------------------------------
+            # Recorded-video pacing
+            #
+            # IMPORTANT:
+            # This happens before reading the next frame.
+            # Therefore a 60 FPS video is consumed at roughly
+            # 60 frames/sec rather than as fast as OpenCV allows.
+            # ------------------------------------------------
+
+            if self.source_type == "video":
+
+                self._wait_for_video_frame_time()
+
+                if self.stop_event.is_set():
+
+                    break
+
+            # ------------------------------------------------
             # Read frame
             # ------------------------------------------------
 
@@ -672,12 +1016,6 @@ class Camera:
                 or frame is None
             ):
 
-                self.connected = False
-
-                self.last_error = (
-                    "Frame read failed."
-                )
-
                 # --------------------------------------------
                 # Recorded video
                 # --------------------------------------------
@@ -686,22 +1024,42 @@ class Camera:
 
                     self.video_eof = True
 
+                    self.connected = False
+
+                    self.last_error = (
+                        "End of recorded video."
+                    )
+
                     if self.video_loop:
 
                         print(
                             f"[{self.camera_id}] "
                             "Video ended. "
-                            "Restarting..."
+                            "Looping..."
                         )
+
+                        # ------------------------------------
+                        # Try seeking without reopening.
+                        # ------------------------------------
+
+                        if self._restart_video_from_beginning():
+
+                            continue
+
+                        # ------------------------------------
+                        # If seeking failed, release capture.
+                        # The next iteration will reopen it.
+                        # ------------------------------------
 
                         self._release_capture()
 
                         time.sleep(
-                            0.2
+                            0.1
                         )
 
                         continue
 
+                    # No loop requested.
                     print(
                         f"[{self.camera_id}] "
                         "Video ended."
@@ -714,6 +1072,12 @@ class Camera:
                 # --------------------------------------------
                 # RTSP
                 # --------------------------------------------
+
+                self.connected = False
+
+                self.last_error = (
+                    "Frame read failed."
+                )
 
                 if self.reconnect_enabled:
 
@@ -736,44 +1100,6 @@ class Camera:
                 )
 
                 continue
-
-            # ------------------------------------------------
-            # Target FPS
-            # ------------------------------------------------
-
-            if self.target_fps > 0:
-
-                frame_interval = (
-                    1.0
-                    / self.target_fps
-                )
-
-                now = time.time()
-
-                if (
-                    self.last_frame_time > 0
-                    and
-                    (
-                        now
-                        - self.last_frame_time
-                    )
-                    < frame_interval
-                ):
-
-                    sleep_time = (
-                        frame_interval
-                        -
-                        (
-                            now
-                            - self.last_frame_time
-                        )
-                    )
-
-                    if sleep_time > 0:
-
-                        time.sleep(
-                            sleep_time
-                        )
 
             # ------------------------------------------------
             # Timestamp
@@ -1007,7 +1333,9 @@ class Camera:
     # FPS
     # ========================================================
 
-    def get_fps(self) -> float:
+    def get_fps(
+        self,
+    ) -> float:
 
         return float(
             self.current_fps
@@ -1018,7 +1346,7 @@ class Camera:
     # ========================================================
 
     def get_status(
-        self
+        self,
     ) -> CameraStatus:
 
         return CameraStatus(
@@ -1039,7 +1367,9 @@ class Camera:
     # RUNNING
     # ========================================================
 
-    def is_running(self) -> bool:
+    def is_running(
+        self,
+    ) -> bool:
 
         return self.running
 
@@ -1047,7 +1377,9 @@ class Camera:
     # CONNECTED
     # ========================================================
 
-    def is_connected(self) -> bool:
+    def is_connected(
+        self,
+    ) -> bool:
 
         return self.connected
 
@@ -1078,16 +1410,14 @@ class CameraManager:
         )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # get_enabled_cameras() returns a dictionary.
-        #
-        # Example:
+        # get_enabled_cameras() may return:
         #
         # {
         #     "camera_1": {...},
         #     "camera_2": {...}
         # }
+        #
+        # or a list of IDs.
         # ----------------------------------------------------
 
         if isinstance(
@@ -1119,7 +1449,7 @@ class CameraManager:
     # ========================================================
 
     def start_all(
-        self
+        self,
     ) -> dict[str, bool]:
 
         results = {}
@@ -1150,7 +1480,9 @@ class CameraManager:
     # STOP ALL
     # ========================================================
 
-    def stop_all(self) -> None:
+    def stop_all(
+        self,
+    ) -> None:
 
         for camera in (
             self.cameras.values()
@@ -1185,7 +1517,7 @@ class CameraManager:
     # ========================================================
 
     def get_all_cameras(
-        self
+        self,
     ) -> dict[str, Camera]:
 
         return self.cameras
@@ -1194,7 +1526,9 @@ class CameraManager:
     # GET FRAMES
     # ========================================================
 
-    def get_latest_frames(self):
+    def get_latest_frames(
+        self,
+    ):
 
         frames = {}
 
@@ -1219,7 +1553,9 @@ class CameraManager:
     # STATUS
     # ========================================================
 
-    def get_status(self):
+    def get_status(
+        self,
+    ):
 
         return {
             camera_id:
@@ -1245,6 +1581,7 @@ def test_environment() -> bool:
     """
 
     print()
+
     print(
         "Environment:"
     )
@@ -1317,37 +1654,13 @@ def main():
 
     print()
 
-    if not env_ok:
-
-        print(
-            "ERROR: CAMERA_1_RTSP was not found."
-        )
-
-        print()
-        print(
-            "Check your .env file:"
-        )
-
-        print(
-            f"{ENV_FILE}"
-        )
-
-        print()
-
-        print(
-            "Expected variable:"
-        )
-
-        print(
-            "CAMERA_1_RTSP=<your RTSP URL>"
-        )
-
-        print()
-
-        raise SystemExit(1)
-
     # --------------------------------------------------------
-    # Load configuration
+    # NOTE:
+    #
+    # CAMERA_1_RTSP is required only for RTSP configuration.
+    #
+    # If camera_1 is configured as video, don't fail the
+    # standalone test just because RTSP env is empty.
     # --------------------------------------------------------
 
     try:
@@ -1425,6 +1738,44 @@ def main():
         raise SystemExit(1)
 
     # --------------------------------------------------------
+    # RTSP environment validation
+    # --------------------------------------------------------
+
+    if camera.source_type == "rtsp":
+
+        if not env_ok:
+
+            print()
+
+            print(
+                "ERROR: CAMERA_1_RTSP was not found."
+            )
+
+            print()
+
+            print(
+                "Check your .env file:"
+            )
+
+            print(
+                f"{ENV_FILE}"
+            )
+
+            print()
+
+            print(
+                "Expected variable:"
+            )
+
+            print(
+                "CAMERA_1_RTSP=<your RTSP URL>"
+            )
+
+            print()
+
+            raise SystemExit(1)
+
+    # --------------------------------------------------------
     # Start
     # --------------------------------------------------------
 
@@ -1433,6 +1784,7 @@ def main():
     if not started:
 
         print()
+
         print(
             "Initial camera connection failed."
         )
@@ -1508,7 +1860,8 @@ def main():
 
             if (
                 now
-                - last_status_time
+                -
+                last_status_time
                 >= 2.0
             ):
 
@@ -1534,7 +1887,9 @@ def main():
                         f"FPS: "
                         f"{camera.get_fps():.2f} | "
                         f"Connected: "
-                        f"{camera.is_connected()}"
+                        f"{camera.is_connected()} | "
+                        f"Source FPS: "
+                        f"{camera.source_fps:.2f}"
                     )
 
                 else:
@@ -1550,6 +1905,7 @@ def main():
     except KeyboardInterrupt:
 
         print()
+
         print(
             "Keyboard interrupt received."
         )

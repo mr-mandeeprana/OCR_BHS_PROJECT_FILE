@@ -134,7 +134,7 @@ class Config:
     def model_path(self) -> str:
         return self.get_path(
             "detection.model.path",
-            "models/yolo/yolo26n.pt",
+            "models/yolo/iata_tag_yolo26n_best.pt",
         )
 
     @property

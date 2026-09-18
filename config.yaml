@@ -8,7 +8,6 @@ project:
   environment: "development"
   log_level: "INFO"
 
-
 # ============================================================
 # CAMERAS
 # ============================================================
@@ -17,65 +16,92 @@ cameras:
 
   camera_1:
     enabled: true
-    source_type: "rtsp"
-    source_env: "CAMERA_1_RTSP"
+    # rtsp = live camera
+    # video = recorded video for testing
+    source_type: "video"
+
+    # Used when source_type = rtsp
+    # source_env: "CAMERA_1_RTSP"
+    # Used when source_type = rtsp
+    # source_env: "CAMERA_1_RTSP"
+
+    # Used when source_type = video
+    video_source: "videos/input/camera_1_test.mp4"
+
     name: "Camera 1"
     reconnect: true
     reconnect_delay: 2
+
+    # Keep buffer small for minimum latency
     buffer_size: 1
+
+    # 0 = use camera/video native FPS
     target_fps: 0
+
+    # Loop recorded video when testing
+    video_loop: true
 
   camera_2:
     enabled: false
     source_type: "rtsp"
     source_env: "CAMERA_2_RTSP"
+    video_source: "videos/input/camera_2_test.mp4"
     name: "Camera 2"
     reconnect: true
     reconnect_delay: 2
     buffer_size: 1
     target_fps: 0
+    video_loop: true
 
   camera_3:
     enabled: false
     source_type: "rtsp"
     source_env: "CAMERA_3_RTSP"
+    video_source: "videos/input/camera_3_test.mp4"
     name: "Camera 3"
     reconnect: true
     reconnect_delay: 2
     buffer_size: 1
     target_fps: 0
+    video_loop: true
 
   camera_4:
     enabled: false
     source_type: "rtsp"
     source_env: "CAMERA_4_RTSP"
+    video_source: "videos/input/camera_4_test.mp4"
     name: "Camera 4"
     reconnect: true
     reconnect_delay: 2
     buffer_size: 1
     target_fps: 0
-
+    video_loop: true
 
 # ============================================================
 # DETECTION
 # ============================================================
 
 detection:
+  enabled: true
 
-  model:
-    path: "models/yolo/yolo26n.pt"
-    confidence: 0.30
-    image_size: 640
-    device: "cpu"
-    half: false
+  # YOLO model
+  model_path: "models/yolo/iata_tag_yolo26n_best.pt"
+
+  # Minimum YOLO detection confidence
+  confidence: 0.30
+
+  image_size: 640
+  device: "cpu"
 
   classes:
-    tag: 0
+    - 0
 
-  inference:
-    max_detections: 100
-    agnostic_nms: false
+  # IATA tag class
+  class_names:
+    0: "iata_tag"
 
+  half: false
+  max_det: 20
 
 # ============================================================
 # PREPROCESSING
@@ -101,7 +127,6 @@ preprocessing:
     width: 640
     height: 640
 
-
 # ============================================================
 # TRACKING
 # ============================================================
@@ -110,66 +135,195 @@ tracking:
 
   enabled: true
 
+  # Tracker implementation
   tracker: "bytetrack"
 
-  track_high_thresh: 0.50
-  track_low_thresh: 0.10
-  new_track_thresh: 0.60
+  # ----------------------------------------------------------
+  # ByteTrack detection thresholds
+  # ----------------------------------------------------------
 
-  track_buffer: 30
-  match_thresh: 0.80
+  # Match high-confidence detections first.
+  # Aligned with YOLO confidence = 0.30.
+  track_high_thresh: 0.30
 
+  # Lower-confidence detections can help recover
+  # an existing track.
+  track_low_thresh: 0.05
+
+  # Minimum confidence for creating a new track.
+  # Keep this <= YOLO confidence.
+  new_track_thresh: 0.30
+
+  # ----------------------------------------------------------
+  # Track lifetime
+  # ----------------------------------------------------------
+
+  # Number of tracker cycles a lost track can remain alive.
+  #
+  # NOTE: this is now interpreted per CAMERA FRAME (tracker.update()
+  # runs every frame for smooth motion), not per YOLO detection cycle.
+  # At ~60 fps, 45 frames was only 0.75s of loss tolerance. Raised to
+  # give ~1.5-2s so a brief occlusion/motion blur doesn't drop the tag.
+  track_buffer: 120
+
+  # Association threshold.
+  match_thresh: 0.85
+
+  # ----------------------------------------------------------
+  # Association
+  # ----------------------------------------------------------
+
+  # Fuse detection confidence into association score.
   fuse_score: true
 
+  # ----------------------------------------------------------
+  # Track confirmation
+  # ----------------------------------------------------------
+
+  # Number of successful detections before
+  # a track becomes confirmed.
   min_hits: 3
 
-  prediction_buffer: 5
-  max_jump_distance: 200
+  # ----------------------------------------------------------
+  # Prediction
+  # ----------------------------------------------------------
 
+  # Number of consecutive missed YOLO cycles for
+  # which predicted tracking is allowed.
+  #
+  # NOTE: also now counted per camera frame (see track_buffer note
+  # above). 18 frames was only 0.3s at ~60fps - raised so the
+  # predicted/smoothed box comfortably bridges gaps between the
+  # (much slower) YOLO detection cycles without disappearing.
+  prediction_buffer: 90
+
+  # Maximum center movement allowed during association.
+  max_jump_distance: 200.0
+
+  # ----------------------------------------------------------
+  # Tracking stability
+  # ----------------------------------------------------------
+
+  # IoU below this value can indicate unstable association.
   min_iou_warning: 0.10
+
+  # Number of unstable frames before instability is reported.
   unstable_frame_threshold: 5
+
+  # ----------------------------------------------------------
+  # Detection filtering
+  # ----------------------------------------------------------
 
   min_bbox_area: 100
   min_track_confidence: 0.30
 
+  # ----------------------------------------------------------
+  # Motion
+  # ----------------------------------------------------------
+
+  # 0.0 = maximum smoothing
+  # 1.0 = raw velocity
+  velocity_smoothing: 0.70
+
+  # Maximum history points kept per track.
+  history_size: 300
 
 # ============================================================
 # BARCODE
-# Existing barcode_engine.py and barcode_region_processor.py
+#
+# Existing barcode_engine.py and
+# barcode_region_processor.py are used.
 # ============================================================
 
 barcode:
-
   enabled: true
-
   engine: "pyzbar"
 
-  formats:
-    - "CODE128"
+  primary_format: "CODE128"
+
+  fallback_formats:
+    enabled: true
+    formats:
+      - "CODE128"
+      - "CODE39"
+      - "CODE93"
+      - "I25"
+      - "EAN13"
+      - "EAN8"
+      - "UPCA"
+      - "UPCE"
 
   processing:
-    rotations:
-      - 0
-      - 90
-      - 180
-      - 270
+    upscale: 3.0
+    max_variants: 30
 
-    preprocessing: true
+    rotations:
+      enabled: true
+      angles:
+        - 0
+        - 90
+        - 180
+        - 270
+
+    clahe:
+      enabled: true
+      clip_limit: 2.5
+      tile_grid_size: 8
+
+    sharpening:
+      enabled: true
+      sigma: 1.2
+      amount: 1.8
+
+    thresholding:
+      otsu: true
+      adaptive: true
+
+      fixed:
+        enabled: true
+        values:
+          - 80
+          - 100
+          - 120
+          - 140
+          - 160
+          - 180
+          - 200
+
+  region:
+    enabled: true
+    max_regions: 8
+
+    min_area: 250
+    min_area_ratio: 0.008
+    max_area_ratio: 0.65
+
+    min_aspect_ratio: 1.4
+    max_aspect_ratio: 20.0
+
+    min_fill_ratio: 0.04
+    iou_deduplication: 0.60
+    padding_ratio: 0.08
+
+  consensus:
+    enabled: true
+    minimum_confidence: 0.70
 
   worker:
     enabled: true
     count: 2
     queue_size: 50
 
+  duplicate_suppression:
+    enabled: true
+    cooldown_seconds: 3.0
 
 # ============================================================
 # OCR
 # ============================================================
 
 ocr:
-
   enabled: true
-
   engine: "paddle"
 
   languages:
@@ -187,13 +341,11 @@ ocr:
     count: 2
     queue_size: 50
 
-
 # ============================================================
 # VALIDATION
 # ============================================================
 
 validation:
-
   enabled: true
 
   iata:
@@ -207,16 +359,13 @@ validation:
   barcode_ocr:
     require_barcode: false
     require_ocr: false
-
     agreement_required: false
-
 
 # ============================================================
 # BACKGROUND PROCESSING
 # ============================================================
 
 processing:
-
   asynchronous: true
 
   queue:
@@ -224,14 +373,12 @@ processing:
 
   best_frame:
     enabled: true
-
     frames_per_track: 5
     minimum_quality_score: 40.0
 
   duplicate_processing:
     enabled: true
     process_once_per_track: true
-
 
 # ============================================================
 # WORKERS
@@ -255,13 +402,11 @@ workers:
     enabled: true
     count: 1
 
-
 # ============================================================
 # PIPELINE
 # ============================================================
 
 pipeline:
-
   mode: "live"
 
   continuous_detection: true
@@ -274,19 +419,17 @@ pipeline:
 
   graceful_shutdown_timeout: 10
 
-
 # ============================================================
 # DATABASE
 # ============================================================
 
 database:
-
-  enabled: false
-
+  enabled: true
   type: "sqlserver"
 
   host_env: "DB_HOST"
   port: 1433
+
   database_env: "DB_NAME"
   username_env: "DB_USERNAME"
   password_env: "DB_PASSWORD"
@@ -295,6 +438,9 @@ database:
 
   insert_results: true
 
+  driver: "ODBC Driver 18 for SQL Server"
+  encrypt: "yes"
+  trust_server_certificate: "yes"
 
 # ============================================================
 # PATHS
@@ -303,6 +449,7 @@ database:
 paths:
 
   models: "models"
+
   captures: "captures"
   raw_captures: "captures/raw"
   tag_captures: "captures/tags"
@@ -328,13 +475,11 @@ paths:
 
   logs: "logs"
 
-
 # ============================================================
 # DEBUG
 # ============================================================
 
 debug:
-
   enabled: true
 
   save_frames: false
@@ -348,24 +493,33 @@ debug:
     enabled: false
     source: "videos/input/test_video.mp4"
 
-
 # ============================================================
 # PERFORMANCE
 # ============================================================
 
 performance:
 
+  # Small queue = low latency
   frame_queue_size: 2
 
+  # Always prefer newest frame
   drop_old_frames: true
 
+  # Caps how often the tracker (ByteTrack + motion prediction) actually
+  # runs per second. Decoupled from YOLO's own interval so the box can
+  # move smoothly between YOLO cycles, but capped so it doesn't chase
+  # the camera's full native FPS (e.g. 60) and overload the CPU on
+  # top of the OCR/barcode worker threads. 30 is smooth to the eye
+  # while leaving real headroom; lower it (e.g. 20) if CPU is maxed out.
+  max_tracking_fps: 30
+
+  # One shared YOLO model
   shared_model: true
 
   max_camera_threads: 4
 
   measure_fps: true
   measure_latency: true
-
 
 # ============================================================
 # LOGGING
@@ -374,7 +528,6 @@ performance:
 logging:
 
   enabled: true
-
   console: true
   file: true
 
