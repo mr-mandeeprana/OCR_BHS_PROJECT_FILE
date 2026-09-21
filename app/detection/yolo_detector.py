@@ -227,7 +227,32 @@ class YOLODetector:
         if not results:
             return []
 
-        return self._parse_results(results[0])
+        result = results[0]
+
+        if result.boxes is None:
+            return []
+
+        if len(result.boxes) == 0:
+            return []
+
+        # ------------------------------------------------------------
+        # DEBUG: show raw YOLO output before project conversion.
+        # ------------------------------------------------------------
+        try:
+            raw_conf = result.boxes.conf.detach().cpu().numpy()
+            raw_cls = result.boxes.cls.detach().cpu().numpy().astype(int)
+
+            if len(raw_conf):
+                print(
+                    "[YOLO RAW] "
+                    f"boxes={len(raw_conf)} "
+                    f"confidence={float(raw_conf.min()):.3f}-{float(raw_conf.max()):.3f} "
+                    f"classes={raw_cls.tolist()}"
+                )
+        except Exception:
+            pass
+
+        return self._parse_results(result)
 
     # Backward compatibility
     predict = detect

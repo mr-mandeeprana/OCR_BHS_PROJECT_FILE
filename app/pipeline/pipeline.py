@@ -8,13 +8,22 @@ Architecture:
 
     Camera
        |
-       +-----------------------> Latest Frame
+       +-----------------------> Latest Frame (every camera frame)
+       |                               |
+       |                               v
+       |                        Detector thread
+       |                        (YOLO, back-to-back on the newest frame)
+       |                               |
+       |                               v  (frame_id, frame timestamp, detections)
+       v                               |
+    Main loop  <-----------------------+
        |
-       v
-    YOLO Detection
+       +--> TagTracker.update()   once per NEW YOLO result
+       |       (ByteTrack identity + Kalman smoothing, stamped with the
+       |        time of the frame YOLO actually saw)
        |
-       v
-    TagTracker / ByteTrack
+       +--> TagTracker.predict()  once per CAMERA frame
+       |       (boxes glide with the tag between YOLO results)
        |
        v
     Best Frame Selection
@@ -42,13 +51,16 @@ Architecture:
 IMPORTANT
 ---------
 - Camera capture is independent from inference.
-- YOLO runs periodically.
-- Existing TagTracker / ByteTrack implementation is NOT modified.
+- YOLO runs on its OWN thread, as fast as the CPU allows.
+- The tracking loop never waits for YOLO, OCR or barcode.
+- tracker.update() is called ONLY with fresh YOLO results (never with
+  stale detections) and with the timestamp of the frame they came from.
+- tracker.predict() is called for every camera frame so the displayed
+  box moves smoothly with the tag.
 - OCR is asynchronous.
 - Barcode is asynchronous.
-- The live inference loop NEVER waits for OCR/barcode.
 - Best-frame selection uses BestFrameSelector.add_candidate().
-- Latest tracking state is available to the viewer.
+- Latest tracking state is available to the viewer (as copies).
 - Camera-local track IDs are kept separate.
 - No dashboard logic.
 - No jam-detection logic.
@@ -56,8 +68,10 @@ IMPORTANT
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
@@ -152,6 +166,32 @@ class OCRBHSPipeline:
         self._loop_thread: Optional[
             threading.Thread
         ] = None
+
+        # --------------------------------------------------------------------
+        # Detector thread state
+        #
+        # YOLO runs on its own thread so the tracking loop keeps running at
+        # camera rate while inference is in progress.
+        # --------------------------------------------------------------------
+
+        self._detector_thread: Optional[
+            threading.Thread
+        ] = None
+
+        # Newest camera frame waiting for YOLO (single slot: YOLO always
+        # works on the freshest frame, never on a backlog).
+        self._det_cond = threading.Condition()
+
+        self._det_pending: Optional[
+            Tuple[int, float, np.ndarray]
+        ] = None
+
+        # Finished YOLO results waiting for the tracking loop.
+        self._det_results_lock = threading.Lock()
+
+        self._det_results: deque = deque(
+            maxlen=16
+        )
 
         # --------------------------------------------------------------------
         # Tracking state
@@ -314,12 +354,17 @@ class OCRBHSPipeline:
 
         # --------------------------------------------------------------------
         # Detection interval
+        #
+        # Minimum time between two YOLO inference STARTS on the detector
+        # thread. 0.0 = run back-to-back (as fast as the CPU allows), which
+        # gives the smoothest tracking. The old hidden default of 0.20 s
+        # limited YOLO to ~5 FPS. Raise it only if the CPU is saturated.
         # --------------------------------------------------------------------
 
         self.detection_interval_seconds = self._get_float(
             processing_cfg,
             "detection_interval",
-            0.20,
+            0.0,
         )
 
         if "detection_interval_seconds" in processing_cfg:
@@ -481,15 +526,9 @@ class OCRBHSPipeline:
         # --------------------------------------------------------------------
         # Tracking update rate cap.
         #
-        # tracker.update() now runs independently of YOLO's slower
-        # detection_interval_seconds (for smooth box motion), but running
-        # it completely uncapped means chasing the camera's native frame
-        # rate (e.g. 60fps) on every loop iteration. On CPU, combined with
-        # OCR/barcode worker threads competing for the same cores/GIL,
-        # that much per-frame Python overhead can starve the main loop
-        # badly enough to desync it from real time. Cap it instead to a
-        # rate that is still far smoother than the old
-        # detection_interval_seconds-gated behaviour, but bounded.
+        # Kept for config compatibility. The tracker's per-frame predict()
+        # now runs once per NEW camera frame (it is only a few microseconds
+        # per track), so this value is informational.
         # --------------------------------------------------------------------
 
         max_tracking_fps = self._get_float(
@@ -715,12 +754,26 @@ class OCRBHSPipeline:
     def _track_predicted(
         track: Any,
     ) -> bool:
+        """
+        The project Track model exposes ``is_predicted``. The previous
+        code only read ``predicted`` (which does not exist on Track), so
+        it always returned False and predicted-only boxes were being used
+        for best-frame selection and OCR/barcode submission.
+        """
 
         value = getattr(
             track,
-            "predicted",
-            False,
+            "is_predicted",
+            None,
         )
+
+        if value is None:
+
+            value = getattr(
+                track,
+                "predicted",
+                False,
+            )
 
         return bool(value)
 
@@ -1920,7 +1973,12 @@ class OCRBHSPipeline:
 
             accepted = (
                 self.worker_manager.submit_ocr(
-                    task
+                    task_id=task.task_id,
+                    camera_id=task.camera_id,
+                    track_id=task.track_id,
+                    frame=task.frame,
+                    timestamp=task.timestamp,
+                    metadata=task.metadata,
                 )
             )
 
@@ -2062,7 +2120,12 @@ class OCRBHSPipeline:
 
             accepted = (
                 self.worker_manager.submit_barcode(
-                    task
+                    task_id=task.task_id,
+                    camera_id=task.camera_id,
+                    track_id=task.track_id,
+                    frame=task.frame,
+                    timestamp=task.timestamp,
+                    metadata=task.metadata,
                 )
             )
 
@@ -2122,6 +2185,11 @@ class OCRBHSPipeline:
         timestamp: float,
         frame: np.ndarray,
     ) -> None:
+        """
+        Called once per fresh YOLO result with the tracks the tracker
+        computed FOR THAT frame, plus that same frame. The box and the
+        image therefore always describe the same instant.
+        """
 
         for track in tracks:
 
@@ -2146,6 +2214,16 @@ class OCRBHSPipeline:
                 continue
 
             # ----------------------------------------------------------------
+            # Never process predicted-only frames (no real detection).
+            # ----------------------------------------------------------------
+
+            if self._track_predicted(
+                track
+            ):
+
+                continue
+
+            # ----------------------------------------------------------------
             # Store best-frame candidate.
             # ----------------------------------------------------------------
 
@@ -2155,16 +2233,6 @@ class OCRBHSPipeline:
                 timestamp=timestamp,
                 frame=frame,
             )
-
-            # ----------------------------------------------------------------
-            # Never process predicted-only frames.
-            # ----------------------------------------------------------------
-
-            if self._track_predicted(
-                track
-            ):
-
-                continue
 
             # ----------------------------------------------------------------
             # OCR
@@ -2340,6 +2408,184 @@ class OCRBHSPipeline:
             return []
 
     # ========================================================================
+    # DETECTOR THREAD
+    # ========================================================================
+
+    def _submit_frame_to_detector(
+        self,
+        frame_id: int,
+        timestamp: float,
+        frame: np.ndarray,
+    ) -> None:
+        """
+        Hand the newest camera frame to the detector thread.
+
+        Single slot: if YOLO is still busy, the previous pending frame is
+        simply replaced, so YOLO always starts on the freshest frame and
+        this call never blocks the tracking loop.
+        """
+
+        with self._det_cond:
+
+            self._det_pending = (
+                frame_id,
+                timestamp,
+                frame,
+            )
+
+            self._det_cond.notify()
+
+    def _take_detection_results(
+        self,
+    ) -> List[
+        Tuple[int, float, List[Any], np.ndarray]
+    ]:
+        """
+        Return (and clear) every finished YOLO result, oldest first, as
+        (frame_id, frame_timestamp, detections, frame).
+        """
+
+        with self._det_results_lock:
+
+            items = list(
+                self._det_results
+            )
+
+            self._det_results.clear()
+
+        return items
+
+    def _detector_loop(
+        self,
+    ) -> None:
+
+        print(
+            "[PIPELINE] Entered detector loop."
+        )
+
+        last_start = 0.0
+
+        while not self._stop_event.is_set():
+
+            # Optional cap: minimum time between two inference starts.
+            remaining = self.detection_interval_seconds - (
+                time.perf_counter() - last_start
+            )
+
+            if (
+                remaining > 0
+                and self._stop_event.wait(
+                    remaining
+                )
+            ):
+
+                break
+
+            with self._det_cond:
+
+                if self._det_pending is None:
+
+                    self._det_cond.wait(
+                        timeout=0.05
+                    )
+
+                item = self._det_pending
+
+                self._det_pending = None
+
+            if item is None:
+
+                continue
+
+            (
+                frame_id,
+                timestamp,
+                frame,
+            ) = item
+
+            last_start = time.perf_counter()
+
+            try:
+
+                detections = self._run_detection(
+                    frame
+                )
+
+            except Exception as exc:
+
+                self.detection_errors += 1
+
+                self.last_detection_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                print(
+                    "[PIPELINE] Detector loop error: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                time.sleep(
+                    0.02
+                )
+
+                continue
+
+            self.detection_runs += 1
+
+            with self._det_results_lock:
+
+                self._det_results.append(
+                    (
+                        frame_id,
+                        timestamp,
+                        detections,
+                        frame,
+                    )
+                )
+
+        print(
+            "[PIPELINE] Detector loop stopped"
+        )
+
+    def _start_detector_thread(
+        self,
+    ) -> None:
+
+        self._detector_thread = threading.Thread(
+            target=self._detector_loop,
+            name=(
+                f"OCR-BHS-Detector-"
+                f"{self.camera_id}"
+            ),
+            daemon=True,
+        )
+
+        self._detector_thread.start()
+
+    def _stop_detector_thread(
+        self,
+    ) -> None:
+
+        with self._det_cond:
+
+            self._det_cond.notify_all()
+
+        thread = self._detector_thread
+
+        if (
+            thread is not None
+            and thread.is_alive()
+            and threading.current_thread()
+            is not thread
+        ):
+
+            thread.join(
+                timeout=5.0
+            )
+
+        self._detector_thread = None
+
+    # ========================================================================
     # TRACKING
     # ========================================================================
 
@@ -2347,11 +2593,19 @@ class OCRBHSPipeline:
         self,
         frame_id: int,
         detections: List[Any],
+        timestamp: Optional[float] = None,
     ) -> List[Any]:
+        """
+        Feed ONE fresh YOLO result to the tracker.
+
+        ``frame_id`` / ``timestamp`` must be those of the frame YOLO
+        analysed (not the newest camera frame).
+        """
 
         tracks = self.tracker.update(
             frame_id=frame_id,
             detections=detections,
+            timestamp=timestamp,
         )
 
         if tracks is None:
@@ -2367,6 +2621,75 @@ class OCRBHSPipeline:
         except TypeError:
 
             return []
+
+    def _predict_tracker(
+        self,
+        frame_id: int,
+        timestamp: float,
+    ) -> Optional[List[Any]]:
+        """
+        Move the tracker's boxes to where the tags should be at
+        ``timestamp`` (the current camera frame). Returns None if the
+        tracker has no predict() method.
+        """
+
+        predict = getattr(
+            self.tracker,
+            "predict",
+            None,
+        )
+
+        if not callable(predict):
+
+            return None
+
+        try:
+
+            tracks = predict(
+                frame_id=frame_id,
+                timestamp=timestamp,
+            )
+
+        except Exception as exc:
+
+            print(
+                "[PIPELINE] tracker.predict() error: "
+                f"{exc}"
+            )
+
+            return None
+
+        return list(
+            tracks or []
+        )
+
+    @staticmethod
+    def _snapshot_tracks(
+        tracks: Optional[List[Any]],
+    ) -> List[Any]:
+        """
+        The tracker mutates its Track objects in place on the next
+        frame. The viewer gets its own copies, otherwise it could draw
+        a box that is half old / half new.
+        """
+
+        snapshot: List[Any] = []
+
+        for track in tracks or []:
+
+            try:
+
+                snapshot.append(
+                    copy.copy(track)
+                )
+
+            except Exception:
+
+                snapshot.append(
+                    track
+                )
+
+        return snapshot
 
     # ========================================================================
     # LIVE TRACK STATE
@@ -2440,16 +2763,29 @@ class OCRBHSPipeline:
     def _run_loop(
         self,
     ) -> None:
+        """
+        Camera-rate tracking loop. It never runs YOLO itself and never
+        waits for it.
+
+        Per new camera frame:
+            1. hand the frame to the detector thread (non-blocking)
+            2. feed every NEW YOLO result to tracker.update(), stamped
+               with the time of the frame YOLO analysed; run OCR/barcode
+               scheduling with that same frame
+            3. tracker.predict() moves the boxes to the current frame
+            4. publish the tracks (copies) for the viewer
+            5. drain OCR / barcode results
+        """
 
         print(
             "[PIPELINE] Entered processing loop."
         )
 
-        last_detection_time = 0.0
-
-        last_tracking_time = 0.0
-
         last_frame_id = None
+
+        last_tracks: List[Any] = []
+
+        results_seen = 0
 
         while not self._stop_event.is_set():
 
@@ -2490,126 +2826,123 @@ class OCRBHSPipeline:
 
                 last_frame_id = frame_id
 
-                now = time.perf_counter()
-
                 # ------------------------------------------------------------
-                # Tracking update rate cap (see __init__ note on
-                # tracking_interval_seconds / performance.max_tracking_fps).
-                #
-                # Keeps the tracker-driven smoothing decoupled from YOLO's
-                # slower interval (for smooth motion) WITHOUT chasing the
-                # camera's full native frame rate on every single loop
-                # iteration, which was overloading the CPU / GIL badly
-                # enough to desync the pipeline from real time and starve
-                # YOLO of usable frames.
+                # 1) Newest frame -> detector thread (never blocks).
                 # ------------------------------------------------------------
 
-                if (
-                    self.tracking_interval_seconds > 0
-                    and now - last_tracking_time
-                    < self.tracking_interval_seconds
-                ):
-
-                    time.sleep(
-                        0.001
-                    )
-
-                    continue
-
-                last_tracking_time = now
-
-                # ------------------------------------------------------------
-                # YOLO detection pacing.
-                #
-                # YOLO is the expensive step, so it only runs every
-                # detection_interval_seconds. Tracking, however, must NOT
-                # be gated by this same interval — see below.
-                # ------------------------------------------------------------
-
-                run_detection_this_frame = (
-                    now - last_detection_time
-                    >= self.detection_interval_seconds
-                )
-
-                if run_detection_this_frame:
-
-                    last_detection_time = now
-
-                    self.detection_runs += 1
-
-                    detections = self._run_detection(
-                        frame
-                    )
-
-                else:
-
-                    # No new YOLO result this camera frame. Feed the
-                    # tracker an empty detection list so its own motion
-                    # prediction (see tag_tracker.py's "CONTINUOUS
-                    # PREDICTION" section) can advance the box smoothly
-                    # at full camera frame rate between YOLO cycles,
-                    # instead of holding it frozen for up to
-                    # detection_interval_seconds.
-                    detections = []
-
-                # ------------------------------------------------------------
-                # ByteTrack
-                #
-                # Called on EVERY camera frame, not just detection frames.
-                # This is what makes the box move smoothly and continuously
-                # (via velocity-based prediction) instead of jumping only
-                # once per YOLO cycle.
-                # ------------------------------------------------------------
-
-                tracks = self._update_tracker(
-                    frame_id=frame_id,
-                    detections=detections,
+                self._submit_frame_to_detector(
+                    frame_id,
+                    timestamp,
+                    frame,
                 )
 
                 # ------------------------------------------------------------
-                # Publish latest tracking state.
-                #
-                # Viewer can use this independently from inference speed.
+                # 2) Every fresh YOLO result goes to the tracker exactly once
+                #    (even an empty one: ByteTrack's lost-track lifecycle is
+                #    counted in YOLO results and must advance on each).
+                # ------------------------------------------------------------
+
+                for (
+                    det_frame_id,
+                    det_timestamp,
+                    detections,
+                    det_frame,
+                ) in self._take_detection_results():
+
+                    results_seen += 1
+
+                    self._latest_detection_count = len(
+                        detections
+                    )
+
+                    if detections and (
+                        results_seen <= 5
+                        or results_seen % 20 == 0
+                    ):
+
+                        confidences = [
+                            float(getattr(d, "confidence", 0.0))
+                            for d in detections
+                        ]
+
+                        print(
+                            "[YOLO] "
+                            f"frame={det_frame_id} "
+                            f"detections={len(detections)} "
+                            f"conf={min(confidences):.3f}-{max(confidences):.3f}"
+                        )
+
+                    elif not detections and (
+                        results_seen <= 10
+                        or results_seen % 100 == 0
+                    ):
+
+                        print(
+                            f"[YOLO] frame={det_frame_id} detections=0"
+                        )
+
+                    tracks = self._update_tracker(
+                        frame_id=det_frame_id,
+                        detections=detections,
+                        timestamp=det_timestamp,
+                    )
+
+                    last_tracks = self._snapshot_tracks(
+                        tracks
+                    )
+
+                    # OCR / barcode / best-frame use the detection frame and
+                    # the box the tracker computed FOR THAT frame. This must
+                    # happen BEFORE predict() moves the boxes to "now".
+                    if detections:
+
+                        self._process_tracks(
+                            tracks=tracks,
+                            frame_id=det_frame_id,
+                            timestamp=det_timestamp,
+                            frame=det_frame,
+                        )
+
+                # ------------------------------------------------------------
+                # 3) Every camera frame: glide boxes to the current time.
+                # ------------------------------------------------------------
+
+                predicted = self._predict_tracker(
+                    frame_id,
+                    timestamp,
+                )
+
+                if predicted is not None:
+
+                    last_tracks = self._snapshot_tracks(
+                        predicted
+                    )
+
+                # ------------------------------------------------------------
+                # 4) Publish for the viewer.
                 # ------------------------------------------------------------
 
                 self._set_latest_tracks(
-                    tracks=tracks,
+                    tracks=last_tracks,
                     frame_id=frame_id,
                     timestamp=timestamp,
-                    detection_count=len(
-                        detections
-                    ),
+                    detection_count=self._latest_detection_count,
                 )
 
                 # ------------------------------------------------------------
-                # OCR / Barcode
-                #
-                # This only submits non-blocking tasks. Submission is
-                # independently throttled per-track (ocr/barcode interval),
-                # so calling every frame is safe and does not resubmit
-                # faster than configured.
-                # ------------------------------------------------------------
-
-                self._process_tracks(
-                    tracks=tracks,
-                    frame_id=frame_id,
-                    timestamp=timestamp,
-                    frame=frame,
-                )
-
-                # ------------------------------------------------------------
-                # Drain OCR / barcode results.
+                # 5) Drain OCR / barcode results.
                 #
                 # WorkerManager is a pull-based queue (drain_results /
-                # get_result), it does NOT support add_result_callback.
-                # _attach_worker_result_callback() cannot attach anything
-                # real, so without this poll, submitted OCR/barcode jobs
-                # would complete on the worker threads but their results
-                # would sit in the queue and never reach
+                # get_result); without this poll, submitted jobs would finish
+                # on the worker threads but their results would never reach
                 # _on_worker_result() / ResultManager / the database.
                 # ------------------------------------------------------------
 
                 self._drain_worker_results()
+
+                time.sleep(
+                    0.001
+                )
 
             except Exception as exc:
 
@@ -2620,12 +2953,12 @@ class OCRBHSPipeline:
                 )
 
                 print(
-                    "[PIPELINE] Detection loop error: "
-                    f"{exc}"
+                    "[PIPELINE] Processing loop error: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
                 time.sleep(
-                    0.01
+                    0.02
                 )
 
         print(
@@ -2649,6 +2982,14 @@ class OCRBHSPipeline:
         )
 
         self._stop_event.clear()
+
+        with self._det_cond:
+
+            self._det_pending = None
+
+        with self._det_results_lock:
+
+            self._det_results.clear()
 
         # --------------------------------------------------------------------
         # Workers
@@ -2707,6 +3048,12 @@ class OCRBHSPipeline:
         # --------------------------------------------------------------------
 
         self.running = True
+
+        self._start_detector_thread()
+
+        print(
+            "[PIPELINE] Detector thread started"
+        )
 
         self._loop_thread = threading.Thread(
             target=self._run_loop,
@@ -2776,6 +3123,16 @@ class OCRBHSPipeline:
             )
 
         self._loop_thread = None
+
+        # --------------------------------------------------------------------
+        # Detector thread
+        # --------------------------------------------------------------------
+
+        self._stop_detector_thread()
+
+        print(
+            "[PIPELINE] Detector thread stopped"
+        )
 
         # --------------------------------------------------------------------
         # Camera
@@ -3182,6 +3539,9 @@ if __name__ == "__main__":
 
         # --------------------------------------------------------------------
         # Bare ndarray camera test
+        #
+        # The pipeline reads `frame_count` / `last_frame_time` from the
+        # camera when get_latest_frame() returns a bare ndarray.
         # --------------------------------------------------------------------
 
         test_frame = np.zeros(
@@ -3197,9 +3557,9 @@ if __name__ == "__main__":
 
             camera_id = "camera_1"
 
-            frame_id = 123
+            frame_count = 123
 
-            frame_timestamp = 456.0
+            last_frame_time = 456.0
 
             def get_latest_frame(
                 self,
@@ -3349,6 +3709,24 @@ if __name__ == "__main__":
 
         print(
             "[PASS] Live tracking state"
+        )
+
+        # --------------------------------------------------------------------
+        # is_predicted detection
+        # --------------------------------------------------------------------
+
+        class _T:
+            is_predicted = True
+
+        class _U:
+            is_predicted = False
+
+        assert pipeline._track_predicted(_T()) is True
+
+        assert pipeline._track_predicted(_U()) is False
+
+        print(
+            "[PASS] Predicted-track detection"
         )
 
         print(

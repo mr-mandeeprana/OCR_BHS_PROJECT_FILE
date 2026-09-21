@@ -1,6 +1,10 @@
 # ============================================================
 # OCR_BHS PROJECT - CENTRAL CONFIGURATION
 # ============================================================
+#
+# Lines marked  [CHANGED]  differ from the previous config and are
+# the ones that fix the missing / jumping tracking box.
+# Lines marked  [NEW]      are new keys.
 
 project:
   name: "OCR_BHS"
@@ -22,8 +26,6 @@ cameras:
 
     # Used when source_type = rtsp
     # source_env: "CAMERA_1_RTSP"
-    # Used when source_type = rtsp
-    # source_env: "CAMERA_1_RTSP"
 
     # Used when source_type = video
     video_source: "videos/input/camera_1_test.mp4"
@@ -33,12 +35,15 @@ cameras:
     reconnect_delay: 2
 
     # Keep buffer small for minimum latency
-    buffer_size: 1
+    buffer_size: 3
 
     # 0 = use camera/video native FPS
-    target_fps: 0
+    target_fps: 20
 
-    # Loop recorded video when testing
+    # Loop recorded video when testing.
+    # (When the video restarts, the tag "teleports" back to its start
+    #  position; the tracker will drop the old track and start a new one.
+    #  That is expected and not a tracking bug.)
     video_loop: true
 
   camera_2:
@@ -87,9 +92,20 @@ detection:
   # YOLO model
   model_path: "models/yolo/iata_tag_yolo26n_best.pt"
 
-  # Minimum YOLO detection confidence
-  confidence: 0.30
+  # [CHANGED] 0.30 -> 0.12
+  # YOLO must also report LOW-confidence boxes (blurred / partly
+  # hidden tags). ByteTrack uses boxes between 0.10 and the
+  # activation threshold ONLY to keep an already-existing track
+  # alive - they can never start a new track (that needs
+  # tracking.new_track_thresh). With 0.30 here, ByteTrack's
+  # low-score rescue stage never received anything, so the box
+  # vanished every time the tag blurred.
+  confidence: 0.12
 
+  # YOLO speed is the most important number for smooth tracking.
+  # Aim for >= 8-10 detections/second per camera (check the
+  # "detection_runs" stat). If it is lower, reduce this to 512 or
+  # crop to the conveyor area. Do NOT raise it unless YOLO is fast.
   image_size: 640
   device: "cpu"
 
@@ -130,6 +146,16 @@ preprocessing:
 # ============================================================
 # TRACKING
 # ============================================================
+#
+# How it works now:
+#   * ByteTrack (supervision) only decides WHICH box is WHICH tag.
+#   * A per-track Kalman filter produces the displayed, smoothed box.
+#   * tracker.update()  runs once per NEW YOLO result.
+#   * tracker.predict() runs on EVERY camera frame, so the box
+#     glides with the tag between YOLO results.
+#
+# All "buffer / miss / hits" counters below are counted in YOLO
+# RESULTS (not camera frames).
 
 tracking:
 
@@ -142,36 +168,32 @@ tracking:
   # ByteTrack detection thresholds
   # ----------------------------------------------------------
 
-  # Match high-confidence detections first.
-  # Aligned with YOLO confidence = 0.30.
   track_high_thresh: 0.30
 
-  # Lower-confidence detections can help recover
-  # an existing track.
+  # Pre-filter before ByteTrack (ByteTrack itself ignores < 0.10).
   track_low_thresh: 0.05
 
-  # Minimum confidence for creating a new track.
-  # Keep this <= YOLO confidence.
+  # Minimum confidence to START a new track. Now exact (the tracker
+  # compensates for supervision's hidden +0.10 offset).
+  # Keep this >= detection.confidence.
   new_track_thresh: 0.30
 
   # ----------------------------------------------------------
   # Track lifetime
   # ----------------------------------------------------------
 
-  # Number of tracker cycles a lost track can remain alive.
-  #
-  # NOTE: this is now interpreted per CAMERA FRAME (tracker.update()
-  # runs every frame for smooth motion), not per YOLO detection cycle.
-  # At ~60 fps, 45 frames was only 0.75s of loss tolerance. Raised to
-  # give ~1.5-2s so a brief occlusion/motion blur doesn't drop the tag.
-  track_buffer: 120
+  # [CHANGED] 45 -> 30
+  # YOLO results a lost track stays alive inside ByteTrack
+  # (~3 s at ~10 detections/s).
+  track_buffer: 30
 
-  # Association threshold.
-  match_thresh: 0.85
-
-  # ----------------------------------------------------------
-  # Association
-  # ----------------------------------------------------------
+  # [CHANGED] 0.85 -> 0.95
+  # More forgiving association when the tag moves far between two
+  # YOLO results (fast conveyor / slow YOLO). In tests this was the
+  # difference between losing the tag and keeping it when YOLO ran
+  # at <= 6 detections/second. It did not cause ID swaps for two
+  # parallel tags.
+  match_thresh: 0.95
 
   # Fuse detection confidence into association score.
   fuse_score: true
@@ -180,52 +202,75 @@ tracking:
   # Track confirmation
   # ----------------------------------------------------------
 
-  # Number of successful detections before
-  # a track becomes confirmed.
-  min_hits: 3
+  # [CHANGED] 3 -> 2
+  # Real YOLO detections needed before a track is confirmed
+  # (eligible for OCR/barcode). ByteTrack itself outputs a new
+  # track from its 2nd detection, so 2 here = confirmed on the
+  # 3rd detection (~0.3 s).
+  min_hits: 2
 
   # ----------------------------------------------------------
-  # Prediction
+  # Prediction (drawing the box while YOLO misses the tag)
   # ----------------------------------------------------------
 
-  # Number of consecutive missed YOLO cycles for
-  # which predicted tracking is allowed.
-  #
-  # NOTE: also now counted per camera frame (see track_buffer note
-  # above). 18 frames was only 0.3s at ~60fps - raised so the
-  # predicted/smoothed box comfortably bridges gaps between the
-  # (much slower) YOLO detection cycles without disappearing.
-  prediction_buffer: 90
+  # [CHANGED] 18 -> 12
+  # Consecutive missed YOLO results the box is still drawn for.
+  prediction_buffer: 12
 
-  # Maximum center movement allowed during association.
+  # [NEW] Hard cap in SECONDS on drawing a box with no real
+  # detection, regardless of prediction_buffer.
+  max_coast_seconds: 1.0
+
+  # [NEW] While coasting, the box velocity halves every N seconds
+  # so a vanished tag does not drift away forever.
+  coast_velocity_half_life: 1.0
+
+  # ----------------------------------------------------------
+  # Smoothing (Kalman filter)  [NEW]
+  # ----------------------------------------------------------
+
+  # Expected YOLO centre jitter as a fraction of sqrt(width*height).
+  # Higher = smoother box but slightly slower reaction.
+  measurement_noise_ratio: 0.03
+
+  # Expected tag acceleration noise in px/s^2.
+  # Lower  (100-200) = very steady, straight-line box.
+  # Higher (500-1000) = follows sudden stops / speed-ups faster.
+  process_noise_accel: 300.0
+
+  # Width/height smoothing (0..1). Lower = steadier box size.
+  size_smoothing: 0.35
+
+  # Velocities below this (px/s) are treated as "standing still".
+  min_render_speed: 5.0
+
+  # ----------------------------------------------------------
+  # Tracking stability (diagnostic flags only)
+  # ----------------------------------------------------------
+
+  # Max centre movement between two YOLO results before the
+  # "motion jump" flag is raised.
   max_jump_distance: 200.0
-
-  # ----------------------------------------------------------
-  # Tracking stability
-  # ----------------------------------------------------------
 
   # IoU below this value can indicate unstable association.
   min_iou_warning: 0.10
 
-  # Number of unstable frames before instability is reported.
+  # Number of unstable YOLO results before instability is reported.
   unstable_frame_threshold: 5
 
   # ----------------------------------------------------------
-  # Detection filtering
+  # Detection filtering (output-side only)
   # ----------------------------------------------------------
 
   min_bbox_area: 100
-  min_track_confidence: 0.30
+  min_track_confidence: 0.03
 
   # ----------------------------------------------------------
-  # Motion
+  # Legacy keys (read by older code paths; not used by the
+  # Kalman smoothing)
   # ----------------------------------------------------------
 
-  # 0.0 = maximum smoothing
-  # 1.0 = raw velocity
   velocity_smoothing: 0.70
-
-  # Maximum history points kept per track.
   history_size: 300
 
 # ============================================================
@@ -368,6 +413,18 @@ validation:
 processing:
   asynchronous: true
 
+  # [NEW] (was an invisible hard-coded 0.20 s in pipeline.py, i.e.
+  # YOLO limited to ~5 FPS - the main cause of the jumping box.)
+  # Minimum seconds between two YOLO inference starts on the
+  # detector thread. 0.0 = run back-to-back as fast as the CPU
+  # allows (smoothest). Raise to e.g. 0.05 only if the CPU is
+  # saturated and OCR/barcode workers are starving.
+  detection_interval: 0.0
+
+  # [NEW] Explicit values (these were the code defaults).
+  ocr_interval: 0.5
+  barcode_interval: 0.5
+
   queue:
     max_size: 100
 
@@ -379,6 +436,9 @@ processing:
   duplicate_processing:
     enabled: true
     process_once_per_track: true
+    retry_failed_results: true
+    max_ocr_attempts: 3
+    max_barcode_attempts: 3
 
 # ============================================================
 # WORKERS
@@ -505,15 +565,16 @@ performance:
   # Always prefer newest frame
   drop_old_frames: true
 
-  # Caps how often the tracker (ByteTrack + motion prediction) actually
-  # runs per second. Decoupled from YOLO's own interval so the box can
-  # move smoothly between YOLO cycles, but capped so it doesn't chase
-  # the camera's full native FPS (e.g. 60) and overload the CPU on
-  # top of the OCR/barcode worker threads. 30 is smooth to the eye
-  # while leaving real headroom; lower it (e.g. 20) if CPU is maxed out.
-  max_tracking_fps: 30
+  # [REMOVED] max_tracking_fps - no longer used. The tracker's
+  # per-frame predict() is only a few microseconds per track and
+  # now runs once per camera frame.
 
-  # One shared YOLO model
+  # One shared YOLO model.
+  # NOTE: inference calls are serialized by a lock, so with
+  # several cameras enabled the YOLO throughput is SHARED between
+  # them (4 cameras at ~11 detections/s total = ~3/s each, which
+  # is too slow for smooth tracking). For more than 1-2 cameras,
+  # use shared_model: false (one model per camera) or a GPU.
   shared_model: true
 
   max_camera_threads: 4

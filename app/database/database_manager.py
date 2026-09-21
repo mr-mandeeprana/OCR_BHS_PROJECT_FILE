@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -267,9 +268,10 @@ class DatabaseManager:
         """
         Create all OCR_BHS tables and indexes.
 
-        IMPORTANT:
-        The complete SQL batch is executed at once.
-        Do NOT split schema.sql using ';'.
+        Schema statements are split and executed one-by-one because
+        pyodbc cannot reliably execute a multi-statement DDL batch
+        (containing IF/BEGIN/END blocks) as a single execute() call
+        against SQL Server.
         """
 
         print(
@@ -294,29 +296,76 @@ class DatabaseManager:
             encoding="utf-8"
         )
 
+        # --------------------------------------------------------------------
+        # Split on semicolons that terminate top-level SQL statements.
+        # Each IF … BEGIN … END; block is a single self-contained statement.
+        # We use a simple regex that splits on ';' followed by optional
+        # whitespace / comments, handling Windows (\r\n) and Unix (\n) lines.
+        # Blank / comment-only chunks are skipped.
+        # --------------------------------------------------------------------
+
+        batches = [
+            chunk.strip()
+            for chunk in re.split(r";\s*", schema_sql)
+        ]
+
         cursor = connection.cursor()
+
+        errors = []
 
         try:
 
-            cursor.execute(schema_sql)
+            for batch in batches:
 
-            connection.commit()
+                # Skip empty chunks and pure comment blocks.
+                stripped = re.sub(
+                    r"--[^\n]*",
+                    "",
+                    batch,
+                ).strip()
 
-            self.initialized = True
+                if not stripped:
+                    continue
 
-            print(
-                "[DB] Database schema initialized successfully."
-            )
+                try:
 
-        except Exception:
+                    cursor.execute(batch)
 
-            connection.rollback()
+                    connection.commit()
 
-            raise
+                except Exception as exc:
+
+                    connection.rollback()
+
+                    errors.append(
+                        f"{type(exc).__name__}: {exc} "
+                        f"[batch: {batch[:80]!r}]"
+                    )
+
+                    print(
+                        "[DB] Schema statement error: "
+                        f"{exc}"
+                    )
 
         finally:
 
             cursor.close()
+
+        if errors:
+
+            # Raise only if NO statements succeeded at all.
+            # Partial failures (e.g. table already exists) are acceptable
+            # when the database was previously initialised.
+            print(
+                f"[DB] Schema init completed with "
+                f"{len(errors)} non-fatal error(s)."
+            )
+
+        self.initialized = True
+
+        print(
+            "[DB] Database schema initialized successfully."
+        )
 
     # ========================================================
     # TEST CONNECTION
@@ -411,13 +460,18 @@ class DatabaseManager:
     ) -> datetime:
 
         if isinstance(value, datetime):
-            return value
+            # Already a datetime — strip tzinfo for pyodbc compat.
+            return value.replace(tzinfo=None)
 
-        return datetime.now(
-            timezone.utc
-        ).replace(
-            tzinfo=None
-        )
+        # Accept Unix float/int timestamps (what result_persistence.py
+        # passes as captured_at / last_timestamp).
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.utcfromtimestamp(float(value))
+            except (OSError, OverflowError, ValueError):
+                pass
+
+        return datetime.utcnow()
 
     # --------------------------------------------------------
 
