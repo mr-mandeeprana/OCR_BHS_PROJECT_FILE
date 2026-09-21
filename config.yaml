@@ -22,13 +22,13 @@ cameras:
     enabled: true
     # rtsp = live camera
     # video = recorded video for testing
-    source_type: "video"
+    source_type: "rtsp"
 
     # Used when source_type = rtsp
-    # source_env: "CAMERA_1_RTSP"
+    source_env: "CAMERA_1_RTSP"
 
     # Used when source_type = video
-    video_source: "videos/input/camera_1_test.mp4"
+    # video_source: "videos/input/camera_1_test.mp4"
 
     name: "Camera 1"
     reconnect: true

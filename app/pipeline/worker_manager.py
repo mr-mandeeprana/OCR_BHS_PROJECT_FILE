@@ -5,6 +5,7 @@ import time
 from typing import Any, Optional
 
 from app.barcode.barcode_engine import BarcodeEngine
+from app.barcode.barcode_region_processor import BarcodeRegionProcessor
 from app.config.config_loader import Config
 from app.ocr.ocr_engine import OCREngine
 from app.pipeline.processing_queue import (
@@ -193,8 +194,13 @@ class WorkerManager:
         # a PaddleOCR object between threads.
         # ---------------------------------------------------------
 
+        # NOTE: BarcodeRegionProcessor internally owns/wraps a
+        # BarcodeEngine (direct full-image decode first, then a
+        # region-based fallback when that fails), so it is a drop-in,
+        # strictly more capable replacement for using BarcodeEngine
+        # directly here.
         self._barcode_engine: Optional[
-            BarcodeEngine
+            BarcodeRegionProcessor
         ] = None
 
         if (
@@ -202,7 +208,7 @@ class WorkerManager:
             and self.barcode_worker_enabled
         ):
 
-            self._barcode_engine = BarcodeEngine(
+            self._barcode_engine = BarcodeRegionProcessor(
                 self.config
             )
 
@@ -686,13 +692,25 @@ class WorkerManager:
         # ---------------------------------------------------------
         # Each barcode worker gets its own engine.
         #
-        # BarcodeEngine itself is lightweight and this avoids
-        # sharing mutable runtime statistics between threads.
+        # Use BarcodeRegionProcessor rather than a bare BarcodeEngine.
+        # BarcodeRegionProcessor already tries a direct full-image
+        # decode first (identical to BarcodeEngine.read()) and only
+        # falls back to locating/decoding barcode sub-regions when
+        # that direct decode fails - exactly the region-based fallback
+        # the barcode region processor was built for, and exactly what
+        # the standalone diagnostic script exercises alongside
+        # BarcodeEngine. Previously this worker only ever got the
+        # direct-decode behaviour and the region fallback was unused
+        # dead code (barcode_region_processor.py was never imported
+        # from anywhere in the running pipeline).
+        #
+        # This is otherwise lightweight and avoids sharing mutable
+        # runtime statistics between threads.
         # ---------------------------------------------------------
 
         try:
 
-            engine = BarcodeEngine(
+            engine = BarcodeRegionProcessor(
                 self.config
             )
 
@@ -767,7 +785,7 @@ class WorkerManager:
     def _process_barcode_task(
         self,
         task: BarcodeTask,
-        engine: BarcodeEngine,
+        engine: BarcodeRegionProcessor,
         worker_name: str,
     ) -> None:
         """
@@ -776,7 +794,13 @@ class WorkerManager:
 
         start = time.perf_counter()
 
-        results = engine.read(
+        # BarcodeRegionProcessor.process() returns the same
+        # list[BarcodeResult] shape as BarcodeEngine.read() (it tries
+        # the direct decode first, internally), so this is a drop-in
+        # call-site swap - no downstream change needed in
+        # ResultManager/_best_barcode(), which already reads results
+        # generically via getattr(item, "value"/"data"/"barcode").
+        results = engine.process(
             task.frame
         )
 

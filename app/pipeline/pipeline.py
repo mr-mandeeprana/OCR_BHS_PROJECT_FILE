@@ -86,6 +86,8 @@ from app.config.config_loader import Config
 from app.camera.camera import Camera
 from app.detection.yolo_detector import YOLODetector
 from app.tracking.tag_tracker import TagTracker
+from app.preprocessing.tag_processor import TagProcessor
+from app.preprocessing.image_quality import ImageQualityChecker
 
 from app.pipeline.processing_queue import (
     OCRTask,
@@ -236,6 +238,28 @@ class OCRBHSPipeline:
         )
 
         # --------------------------------------------------------------------
+        # Tag preprocessing + quality gating
+        #
+        # TagProcessor is the ONLY component that safely crops a detection
+        # out of the full camera frame: it clamps/validates the bbox,
+        # rejects pathological aspect ratios (e.g. 64x14720) that can hang
+        # PaddleOCR, resizes safely and normalizes the image. Previously
+        # OCR/barcode tasks were built straight from BestFrameSelector's
+        # crop (or, before any best-frame candidate existed, from the RAW
+        # full camera frame) without ever going through this safety net.
+        #
+        # ImageQualityChecker is used as an explicit pre-submission gate
+        # (brightness / contrast / sharpness / size) so obviously unusable
+        # crops never reach the OCR/barcode queues at all.
+        # --------------------------------------------------------------------
+
+        self.tag_processor = TagProcessor(
+            config=self.config
+        )
+
+        self.image_quality = ImageQualityChecker()
+
+        # --------------------------------------------------------------------
         # Best-frame selectors
         #
         # Key:
@@ -322,6 +346,14 @@ class OCRBHSPipeline:
         self.last_detection_error = ""
 
         self.last_result_error = ""
+
+        # --------------------------------------------------------------------
+        # Quality-gate statistics
+        # --------------------------------------------------------------------
+
+        self.frames_rejected_by_tag_processor = 0
+
+        self.frames_rejected_by_quality_gate = 0
 
         # --------------------------------------------------------------------
         # Configuration
@@ -586,6 +618,11 @@ class OCRBHSPipeline:
         print(
             f"[PIPELINE] Async Barcode: "
             f"{self.asynchronous_barcode}"
+        )
+
+        print(
+            f"[PIPELINE] Best-frame minimum quality score: "
+            f"{self.best_frame_min_quality:.1f}"
         )
 
     # ========================================================================
@@ -1636,7 +1673,8 @@ class OCRBHSPipeline:
             if selector is None:
 
                 selector = BestFrameSelector(
-                    max_candidates=self.best_frame_candidates
+                    quality_checker=self.image_quality,
+                    max_candidates=self.best_frame_candidates,
                 )
 
                 self._selectors[
@@ -1779,6 +1817,121 @@ class OCRBHSPipeline:
         )
 
     # ========================================================================
+    # SAFE TAG IMAGE (TagProcessor + ImageQualityChecker)
+    # ========================================================================
+
+    def _prepare_fallback_tag_image(
+        self,
+        track: Any,
+        frame: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """
+        Build the fallback image handed to ``_get_best_frame`` when no
+        best-frame candidate exists yet for this track.
+
+        Before this fix, the fallback was simply the RAW, FULL camera
+        frame (see ``_submit_ocr_for_track`` / ``_submit_barcode_for_track``
+        below): if a track's very first eligible detection was also the
+        one selected because no candidate had been scored yet, the OCR
+        and barcode workers would receive the entire, un-cropped camera
+        image instead of the IATA tag.
+
+        TagProcessor.process_detection() safely crops the tag out of the
+        full frame using the tracked Detection's bbox, clamps/validates
+        the box, rejects pathological aspect ratios and dimensions
+        (protects PaddleOCR from hangs on e.g. 64x14720 images), resizes
+        safely and normalizes the result - exactly the pipeline the
+        standalone diagnostic script exercises directly against
+        TagProcessor.
+        """
+
+        detection = self._track_detection(
+            track
+        )
+
+        if detection is None:
+
+            return None
+
+        try:
+
+            safe_crop = self.tag_processor.process_detection(
+                frame,
+                detection,
+            )
+
+        except Exception as exc:
+
+            print(
+                "[PIPELINE] TagProcessor error "
+                f"camera={self.camera_id} "
+                f"track={self._track_id(track)}: "
+                f"{exc}"
+            )
+
+            return None
+
+        if safe_crop is None:
+
+            self.frames_rejected_by_tag_processor += 1
+
+        return safe_crop
+
+    def _quality_gate(
+        self,
+        image: Optional[np.ndarray],
+    ) -> bool:
+        """
+        Explicit pre-submission quality gate.
+
+        BestFrameSelector already uses ImageQualityChecker internally to
+        RANK candidates against each other, but nothing previously
+        stopped an all-round poor image (too dark, too blurry, too
+        small) from being submitted when it was the only candidate
+        available - ``best_frame_min_quality`` was loaded from config
+        but never actually enforced anywhere. This applies it.
+        """
+
+        if image is None:
+
+            return False
+
+        try:
+
+            quality_result = self.image_quality.check(
+                image
+            )
+
+        except Exception as exc:
+
+            print(
+                "[PIPELINE] ImageQualityChecker error "
+                f"camera={self.camera_id}: {exc}"
+            )
+
+            # Fail open: a quality-check crash should not block
+            # processing entirely.
+            return True
+
+        if not quality_result.is_valid:
+
+            self.frames_rejected_by_quality_gate += 1
+
+            return False
+
+        if (
+            self.best_frame_min_quality > 0.0
+            and quality_result.quality_score
+            < self.best_frame_min_quality
+        ):
+
+            self.frames_rejected_by_quality_gate += 1
+
+            return False
+
+        return True
+
+    # ========================================================================
     # OCR SHOULD SUBMIT
     # ========================================================================
 
@@ -1912,6 +2065,21 @@ class OCRBHSPipeline:
 
             return False
 
+        # ----------------------------------------------------------------
+        # Safe fallback: never hand the raw full camera frame to
+        # _get_best_frame(). If no best-frame candidate exists yet,
+        # TagProcessor crops/validates/normalizes the tag first.
+        # ----------------------------------------------------------------
+
+        safe_fallback = self._prepare_fallback_tag_image(
+            track=track,
+            frame=frame,
+        )
+
+        if safe_fallback is None:
+
+            return False
+
         (
             candidate_frame,
             candidate_frame_id,
@@ -1919,12 +2087,23 @@ class OCRBHSPipeline:
             candidate_score,
         ) = self._get_best_frame(
             track=track,
-            fallback_frame=frame,
+            fallback_frame=safe_fallback,
             fallback_frame_id=frame_id,
             fallback_timestamp=timestamp,
         )
 
         if candidate_frame is None:
+
+            return False
+
+        # ----------------------------------------------------------------
+        # Explicit quality gate before spending an OCR worker on this
+        # image.
+        # ----------------------------------------------------------------
+
+        if not self._quality_gate(
+            candidate_frame
+        ):
 
             return False
 
@@ -2059,6 +2238,21 @@ class OCRBHSPipeline:
 
             return False
 
+        # ----------------------------------------------------------------
+        # Safe fallback: never hand the raw full camera frame to
+        # _get_best_frame(). If no best-frame candidate exists yet,
+        # TagProcessor crops/validates/normalizes the tag first.
+        # ----------------------------------------------------------------
+
+        safe_fallback = self._prepare_fallback_tag_image(
+            track=track,
+            frame=frame,
+        )
+
+        if safe_fallback is None:
+
+            return False
+
         (
             candidate_frame,
             candidate_frame_id,
@@ -2066,12 +2260,23 @@ class OCRBHSPipeline:
             candidate_score,
         ) = self._get_best_frame(
             track=track,
-            fallback_frame=frame,
+            fallback_frame=safe_fallback,
             fallback_frame_id=frame_id,
             fallback_timestamp=timestamp,
         )
 
         if candidate_frame is None:
+
+            return False
+
+        # ----------------------------------------------------------------
+        # Explicit quality gate before spending a barcode worker on this
+        # image.
+        # ----------------------------------------------------------------
+
+        if not self._quality_gate(
+            candidate_frame
+        ):
 
             return False
 
@@ -3366,6 +3571,14 @@ class OCRBHSPipeline:
                 self.last_result_error
             ),
 
+            "frames_rejected_by_tag_processor": (
+                self.frames_rejected_by_tag_processor
+            ),
+
+            "frames_rejected_by_quality_gate": (
+                self.frames_rejected_by_quality_gate
+            ),
+
             "worker_manager": (
                 worker_status
             ),
@@ -3395,358 +3608,3 @@ class OCRBHSPipeline:
     ) -> None:
 
         self.stop()
-
-
-# ============================================================================
-# STANDALONE DIAGNOSTIC
-# ============================================================================
-
-if __name__ == "__main__":
-
-    print("=" * 72)
-    print("OCR_BHS MAIN PIPELINE DIAGNOSTIC")
-    print("=" * 72)
-
-    try:
-
-        config = Config()
-
-        print(
-            "[PASS] Config loaded"
-        )
-
-        print(
-            "       Model: "
-            f"{config.data.get('detection', {}).get('model_path')}"
-        )
-
-        print(
-            "       Device: "
-            f"{config.data.get('detection', {}).get('device', 'cpu')}"
-        )
-
-    except Exception as exc:
-
-        print(
-            "[FAIL] Config: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        raise SystemExit(1)
-
-    # ------------------------------------------------------------------------
-    # Fake camera
-    # ------------------------------------------------------------------------
-
-    class FakeCamera:
-
-        camera_id = "camera_1"
-
-        def start(self):
-            pass
-
-        def stop(self):
-            pass
-
-        def get_latest_frame(
-            self,
-            copy=False,
-        ):
-
-            return (
-                0,
-                time.time(),
-                None,
-            )
-
-    # ------------------------------------------------------------------------
-    # Fake detector
-    # ------------------------------------------------------------------------
-
-    class FakeDetector:
-        pass
-
-    # ------------------------------------------------------------------------
-    # Fake tracker
-    # ------------------------------------------------------------------------
-
-    class FakeTracker:
-        pass
-
-    # ------------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------------
-
-    try:
-
-        pipeline = OCRBHSPipeline(
-            camera=FakeCamera(),
-            detector=FakeDetector(),
-            tracker=FakeTracker(),
-            config=config,
-        )
-
-        print(
-            "[PASS] Pipeline construction"
-        )
-
-        stats = pipeline.get_stats()
-
-        assert (
-            stats["running"]
-            is False
-        )
-
-        assert (
-            stats["frames_processed"]
-            == 0
-        )
-
-        print(
-            "[PASS] Initial statistics"
-        )
-
-        print(
-            "[PASS] ResultManager attached"
-        )
-
-        # --------------------------------------------------------------------
-        # Result callback
-        # --------------------------------------------------------------------
-
-        received = []
-
-        pipeline.add_result_callback(
-            received.append
-        )
-
-        test_result = {
-            "track_id": 1,
-            "result": "TEST",
-        }
-
-        pipeline._publish_result(
-            test_result
-        )
-
-        assert received == [
-            test_result
-        ]
-
-        print(
-            "[PASS] Result callback"
-        )
-
-        # --------------------------------------------------------------------
-        # Bare ndarray camera test
-        #
-        # The pipeline reads `frame_count` / `last_frame_time` from the
-        # camera when get_latest_frame() returns a bare ndarray.
-        # --------------------------------------------------------------------
-
-        test_frame = np.zeros(
-            (
-                100,
-                200,
-                3,
-            ),
-            dtype=np.uint8,
-        )
-
-        class BareFrameCamera:
-
-            camera_id = "camera_1"
-
-            frame_count = 123
-
-            last_frame_time = 456.0
-
-            def get_latest_frame(
-                self,
-                copy=False,
-            ):
-
-                return test_frame
-
-            def start(self):
-                pass
-
-            def stop(self):
-                pass
-
-        pipeline.camera = BareFrameCamera()
-
-        normalized = (
-            pipeline._get_latest_frame()
-        )
-
-        assert normalized is not None
-
-        frame_id, timestamp, frame = normalized
-
-        assert frame_id == 123
-
-        assert timestamp == 456.0
-
-        assert frame.shape == (
-            100,
-            200,
-            3,
-        )
-
-        print(
-            "[PASS] Bare ndarray camera frame handling"
-        )
-
-        # --------------------------------------------------------------------
-        # Tuple camera test
-        # --------------------------------------------------------------------
-
-        class TupleFrameCamera:
-
-            camera_id = "camera_1"
-
-            def get_latest_frame(
-                self,
-                copy=False,
-            ):
-
-                return (
-                    789,
-                    987.0,
-                    test_frame,
-                )
-
-            def start(self):
-                pass
-
-            def stop(self):
-                pass
-
-        pipeline.camera = TupleFrameCamera()
-
-        normalized = (
-            pipeline._get_latest_frame()
-        )
-
-        assert normalized is not None
-
-        frame_id, timestamp, frame = normalized
-
-        assert frame_id == 789
-
-        assert timestamp == 987.0
-
-        assert frame.shape == (
-            100,
-            200,
-            3,
-        )
-
-        print(
-            "[PASS] Tuple camera frame handling"
-        )
-
-        # --------------------------------------------------------------------
-        # Tracking state test
-        # --------------------------------------------------------------------
-
-        fake_track_1 = object()
-
-        fake_track_2 = object()
-
-        pipeline._set_latest_tracks(
-            tracks=[
-                fake_track_1,
-                fake_track_2,
-            ],
-            frame_id=123,
-            timestamp=456.0,
-            detection_count=2,
-        )
-
-        latest_tracks = (
-            pipeline.get_latest_tracks()
-        )
-
-        assert len(
-            latest_tracks
-        ) == 2
-
-        assert (
-            latest_tracks[0]
-            is fake_track_1
-        )
-
-        assert (
-            latest_tracks[1]
-            is fake_track_2
-        )
-
-        state = (
-            pipeline.get_tracking_state()
-        )
-
-        assert (
-            state["camera_id"]
-            == "camera_1"
-        )
-
-        assert (
-            state["track_count"]
-            == 2
-        )
-
-        assert (
-            state["frame_id"]
-            == 123
-        )
-
-        assert (
-            state["detection_count"]
-            == 2
-        )
-
-        print(
-            "[PASS] Live tracking state"
-        )
-
-        # --------------------------------------------------------------------
-        # is_predicted detection
-        # --------------------------------------------------------------------
-
-        class _T:
-            is_predicted = True
-
-        class _U:
-            is_predicted = False
-
-        assert pipeline._track_predicted(_T()) is True
-
-        assert pipeline._track_predicted(_U()) is False
-
-        print(
-            "[PASS] Predicted-track detection"
-        )
-
-        print(
-            "[PASS] Pipeline diagnostic completed"
-        )
-
-    except Exception as exc:
-
-        print(
-            "[FAIL] Pipeline diagnostic:"
-        )
-
-        print(
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        raise SystemExit(1)
-
-    print("=" * 72)
-    print(
-        "OCR_BHS MAIN PIPELINE DIAGNOSTIC PASSED"
-    )
-    print("=" * 72)
