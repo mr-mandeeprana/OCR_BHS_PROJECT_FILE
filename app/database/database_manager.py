@@ -342,9 +342,18 @@ class DatabaseManager:
                         f"[batch: {batch[:80]!r}]"
                     )
 
+                    # Surface every failing statement loudly instead of
+                    # silently continuing — a failed CREATE TABLE here
+                    # (e.g. from an unquoted reserved keyword) used to be
+                    # masked as a "non-fatal" error, leaving the table
+                    # missing while later inserts failed with a much
+                    # more confusing error.
                     print(
-                        "[DB] Schema statement error: "
+                        "[DB] Schema statement FAILED: "
                         f"{exc}"
+                    )
+                    print(
+                        f"[DB]   -> statement: {batch[:200]!r}"
                     )
 
         finally:
@@ -547,6 +556,13 @@ class DatabaseManager:
             or "unknown"
         )
 
+        # NOTE: "text" is a reserved / deprecated type keyword in
+        # T-SQL (the legacy TEXT data type), so the column name is
+        # wrapped in [text] here and in schema.sql. Leaving it
+        # unquoted causes a syntax error on both CREATE TABLE and
+        # INSERT, which was silently swallowed as "non-fatal" by
+        # initialize() and surfaced later as confusing insert
+        # failures / a missing table.
         query = """
         INSERT INTO dbo.ocr_readings
         (
@@ -556,7 +572,7 @@ class DatabaseManager:
             task_id,
             frame_id,
             captured_at,
-            text,
+            [text],
             normalized_text,
             confidence,
             engine,
@@ -957,6 +973,176 @@ class DatabaseManager:
                 cursor.close()
 
     # ========================================================
+    # FETCH LATEST OCR READINGS (debug helper)
+    # ========================================================
+
+    def fetch_latest_ocr_readings(
+        self,
+        limit: int = 50,
+    ) -> list[dict]:
+        """
+        Convenience helper to inspect dbo.ocr_readings directly —
+        useful for confirming the [text] fix took effect end-to-end.
+        """
+
+        limit = max(
+            1,
+            min(
+                int(limit),
+                1000,
+            ),
+        )
+
+        query = f"""
+        SELECT TOP {limit}
+            id,
+            event_id,
+            camera_id,
+            track_id,
+            frame_id,
+            captured_at,
+            [text],
+            normalized_text,
+            confidence,
+            engine,
+            rotation,
+            success,
+            elapsed_ms,
+            error,
+            created_at
+        FROM dbo.ocr_readings
+        ORDER BY created_at DESC
+        """
+
+        with self.lock:
+
+            connection = self.connect()
+
+            cursor = connection.cursor()
+
+            try:
+
+                cursor.execute(query)
+
+                columns = [
+                    column[0]
+                    for column in cursor.description
+                ]
+
+                rows = cursor.fetchall()
+
+                return [
+                    dict(
+                        zip(
+                            columns,
+                            row,
+                        )
+                    )
+                    for row in rows
+                ]
+
+            finally:
+
+                cursor.close()
+
+    # ========================================================
+    # REPAIR HELPER: recreate ocr_readings from scratch
+    # ========================================================
+
+    def repair_ocr_readings_table(self) -> None:
+        """
+        Drops and recreates dbo.ocr_readings only.
+
+        Use this ONCE if the table was previously created (or attempted)
+        before the [text] reserved-keyword fix, since the original
+        CREATE TABLE statement may have failed silently and left the
+        table missing or malformed. Safe to call repeatedly — it is a
+        no-op once the table matches schema.sql.
+        """
+
+        print(
+            "[DB] Repairing dbo.ocr_readings..."
+        )
+
+        connection = self.connect(
+            self.config.database
+        )
+
+        cursor = connection.cursor()
+
+        try:
+
+            cursor.execute(
+                "IF OBJECT_ID(N'dbo.ocr_readings', N'U') IS NOT NULL "
+                "DROP TABLE dbo.ocr_readings;"
+            )
+
+            connection.commit()
+
+            cursor.execute(
+                """
+                CREATE TABLE dbo.ocr_readings
+                (
+                    id BIGINT IDENTITY(1,1) NOT NULL
+                        CONSTRAINT PK_ocr_readings PRIMARY KEY,
+                    event_id NVARCHAR(100) NULL,
+                    camera_id NVARCHAR(100) NOT NULL,
+                    track_id INT NULL,
+                    task_id NVARCHAR(100) NULL,
+                    frame_id BIGINT NULL,
+                    captured_at DATETIME2(3) NULL,
+                    [text] NVARCHAR(MAX) NULL,
+                    normalized_text NVARCHAR(MAX) NULL,
+                    confidence FLOAT NULL,
+                    engine NVARCHAR(100) NULL,
+                    rotation INT NULL,
+                    success BIT NOT NULL
+                        CONSTRAINT DF_ocr_readings_success DEFAULT (0),
+                    elapsed_ms FLOAT NULL,
+                    error NVARCHAR(MAX) NULL,
+                    details_json NVARCHAR(MAX) NULL,
+                    created_at DATETIME2(3) NOT NULL
+                        CONSTRAINT DF_ocr_readings_created_at
+                        DEFAULT (SYSUTCDATETIME())
+                );
+                """
+            )
+
+            connection.commit()
+
+            cursor.execute(
+                """
+                IF NOT EXISTS
+                (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE name = N'IX_ocr_readings_camera_track'
+                      AND object_id = OBJECT_ID(N'dbo.ocr_readings')
+                )
+                BEGIN
+                    CREATE INDEX IX_ocr_readings_camera_track
+                        ON dbo.ocr_readings(camera_id, track_id);
+                END;
+                """
+            )
+
+            connection.commit()
+
+            print(
+                "[DB] dbo.ocr_readings repaired successfully."
+            )
+
+        except Exception:
+
+            connection.rollback()
+
+            raise
+
+        finally:
+
+            cursor.close()
+
+    # ========================================================
     # CLOSE
     # ========================================================
 
@@ -1333,6 +1519,8 @@ def main() -> None:
         PROJECT_ROOT / "config.yaml"
     )
 
+    manager = None
+
     try:
 
         config = (
@@ -1388,8 +1576,12 @@ def main() -> None:
         )
 
         # ----------------------------------------------------
-        # STEP 4: CREATE TABLES
+        # STEP 4: REPAIR ocr_readings (one-time fix for the
+        # earlier reserved-keyword [text] bug), THEN create the
+        # rest of the schema normally.
         # ----------------------------------------------------
+
+        manager.repair_ocr_readings_table()
 
         manager.initialize()
 
@@ -1420,14 +1612,12 @@ def main() -> None:
 
     finally:
 
-        try:
-            manager.close()
-        except (
-            Exception,
-            UnboundLocalError,
-            NameError,
-        ):
-            pass
+        if manager is not None:
+
+            try:
+                manager.close()
+            except Exception:
+                pass
 
 
 # ============================================================

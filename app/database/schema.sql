@@ -25,7 +25,7 @@ BEGIN
 
         captured_at DATETIME2(3) NULL,
 
-        text NVARCHAR(MAX) NULL,
+        [text] NVARCHAR(MAX) NULL,
 
         normalized_text NVARCHAR(MAX) NULL,
 

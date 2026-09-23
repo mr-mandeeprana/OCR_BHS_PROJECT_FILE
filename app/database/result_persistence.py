@@ -25,6 +25,7 @@ This class only persists results after ResultManager has processed them.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from typing import Any, Optional
@@ -255,7 +256,16 @@ class ResultPersistence:
         result: BarcodeTaskResult,
     ) -> dict[str, Any]:
 
-        data = ResultPersistence._to_dict(result.result)
+        # FIXED: result.result can be a LIST of per-rotation/per-variant
+        # candidate results (that's exactly why _best_barcode() exists
+        # and is already used in _final_payload()). Calling _to_dict()
+        # directly on a list always returned {} (a list has no
+        # to_dict/__dict__/__slots__), which is why every row in
+        # dbo.barcode_readings came through as NULL/0/0 even though
+        # dbo.ocr_barcode_results — which goes through _best_barcode()
+        # — had real values. _best_barcode() transparently handles both
+        # the list case and the single-object case, so use it here too.
+        data = ResultPersistence._best_barcode(result.result)
 
         metadata = (
             result.metadata
@@ -263,18 +273,40 @@ class ResultPersistence:
             else {}
         )
 
+        # Widened lookup chain: real barcode-decoder objects use a
+        # variety of field names (raw_value, decoded, code, text, ...).
+        # The previous fixed whitelist in _to_dict() dropped fields it
+        # didn't already know about, which is why barcode_value/
+        # confidence/success were coming through as NULL/0/0 even
+        # though the combined ocr_barcode_results row had real data.
+        # _to_dict() below now captures every attribute the object
+        # actually has, so this chain has a much better chance of
+        # finding the right one — but we also widen the chain itself
+        # to cover common alternate names.
         barcode_value = (
             data.get("data")
             or data.get("value")
             or data.get("barcode_data")
+            or data.get("raw_value")
+            or data.get("decoded")
+            or data.get("decoded_text")
+            or data.get("code")
+            or data.get("text")
             or ""
         )
 
         barcode_type = (
             data.get("barcode_type")
             or data.get("format")
+            or data.get("symbology")
             or data.get("type")
             or ""
+        )
+
+        confidence = (
+            data.get("confidence")
+            if data.get("confidence") is not None
+            else data.get("score")
         )
 
         return {
@@ -287,7 +319,7 @@ class ResultPersistence:
             "captured_at": result.timestamp,
             "barcode_value": str(barcode_value),
             "barcode_type": str(barcode_type),
-            "confidence": ResultPersistence._float(data.get("confidence", 0.0)),
+            "confidence": ResultPersistence._float(confidence),
             "rotation": data.get("rotation", 0),
             "variant": data.get("variant"),
             "success": bool(data.get("success", bool(barcode_value))),
@@ -339,12 +371,17 @@ class ResultPersistence:
             barcode.get("data")
             or barcode.get("value")
             or barcode.get("barcode_data")
+            or barcode.get("raw_value")
+            or barcode.get("decoded")
+            or barcode.get("decoded_text")
+            or barcode.get("code")
             or ""
         )
 
         barcode_type = (
             barcode.get("barcode_type")
             or barcode.get("format")
+            or barcode.get("symbology")
             or barcode.get("type")
             or ""
         )
@@ -480,6 +517,29 @@ class ResultPersistence:
     def _to_dict(
         value: Any,
     ) -> dict[str, Any]:
+        """
+        Convert a result object into a plain dict of its fields.
+
+        FIXED: previously this only copied a fixed whitelist of
+        attribute names ("success", "text", "confidence", "data",
+        "value", "barcode_data", ...). Any result object whose real
+        field names didn't happen to match that list (e.g.
+        `raw_value`, `decoded`, `symbology`, a dataclass with
+        different field names, etc.) silently produced an EMPTY
+        dict — which is exactly why dbo.barcode_readings was
+        inserting NULL / 0 / 0 for barcode_value / confidence /
+        success on every row, even though the same underlying data
+        showed up correctly in dbo.ocr_barcode_results (which is
+        built from ResultManager's already-normalized
+        TrackResultState, not from the raw BarcodeTaskResult).
+
+        This version pulls every field the object actually has,
+        via (in order): a `to_dict()` method, dataclass introspection,
+        namedtuple `_asdict()`, or plain `vars()` / `__dict__`. The
+        widened `.get(...)` chains in `_barcode_payload` /
+        `_final_payload` then try several likely key names against
+        whatever came back.
+        """
 
         if value is None:
             return {}
@@ -487,44 +547,56 @@ class ResultPersistence:
         if isinstance(value, dict):
             return dict(value)
 
+        # Explicit to_dict() wins if the object provides one.
         try:
-
             if hasattr(value, "to_dict"):
-
                 output = value.to_dict()
-
                 if isinstance(output, dict):
                     return output
-
         except Exception:
             pass
 
-        output = {}
+        # Dataclass instances: asdict() pulls every declared field.
+        try:
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                return dataclasses.asdict(value)
+        except Exception:
+            pass
 
-        for name in (
-            "success",
-            "text",
-            "normalized_text",
-            "confidence",
-            "data",
-            "value",
-            "barcode_data",
-            "barcode_type",
-            "format",
-            "type",
-            "valid",
-            "reason",
-            "identifier_match",
-        ):
+        # Namedtuples.
+        try:
+            if hasattr(value, "_asdict"):
+                converted = value._asdict()
+                if isinstance(converted, dict):
+                    return dict(converted)
+        except Exception:
+            pass
 
-            if hasattr(value, name):
+        # Plain objects / simple classes with instance attributes.
+        try:
+            if hasattr(value, "__dict__"):
+                converted = vars(value)
+                if isinstance(converted, dict) and converted:
+                    return dict(converted)
+        except Exception:
+            pass
 
-                output[name] = getattr(
-                    value,
-                    name,
-                )
+        # __slots__-based objects have no __dict__ — collect slots instead.
+        try:
+            slots = getattr(type(value), "__slots__", None)
+            if slots:
+                if isinstance(slots, str):
+                    slots = (slots,)
+                output = {}
+                for name in slots:
+                    if hasattr(value, name):
+                        output[name] = getattr(value, name)
+                if output:
+                    return output
+        except Exception:
+            pass
 
-        return output
+        return {}
 
     @staticmethod
     def _best_barcode(
