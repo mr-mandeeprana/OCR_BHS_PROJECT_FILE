@@ -50,7 +50,7 @@ cameras:
     enabled: false
     source_type: "rtsp"
     source_env: "CAMERA_2_RTSP"
-    video_source: "videos/input/camera_2_test.mp4"
+    # video_source: "videos/input/camera_2_test.mp4"
     name: "Camera 2"
     reconnect: true
     reconnect_delay: 2
@@ -124,6 +124,14 @@ detection:
 # ============================================================
 
 preprocessing:
+
+  # Tag enhancement used by TagProcessor.normalize() (the image saved to
+  # captures/enhanced and sent to OCR/barcode). If these keys are missing
+  # or false, normalize() returns an unchanged copy of the raw crop.
+  clahe: true          # local contrast
+  gamma: true          # brightens dark / darkens overexposed tags only
+  sharpening: true     # mild unsharp mask
+  denoise: false       # bilateral filter; can soften thin barcode bars
 
   crop:
     enabled: true
@@ -503,6 +511,45 @@ database:
   trust_server_certificate: "yes"
 
 # ============================================================
+# IMAGE SAVING
+# ============================================================
+#
+# Saves processing evidence to disk on a background thread.
+# Independent from ocr.enabled / barcode.enabled - OCR and barcode
+# keep running when saving is off.
+#
+#   captures/tags/      raw IATA tag crop (BestFrameSelector)
+#   captures/enhanced/  after TagProcessor.normalize()
+#   captures/ocr/       exact image sent to the OCR worker
+#   captures/barcode/   exact image sent to the barcode worker
+
+image_saving:
+
+  # MASTER SWITCH - false disables ALL image saving
+  enabled: true
+
+  jpeg_quality: 95
+
+  # If the disk falls behind, drop images instead of growing RAM.
+  max_pending: 64
+
+  tag:
+    enabled: true
+    raw: true
+    enhanced: true
+
+  ocr:
+    enabled: true
+
+  barcode:
+    enabled: true
+
+  # Reserved for failed-evidence saving (kept separate on purpose).
+  failed:
+    enabled: true
+
+
+# ============================================================
 # PATHS
 # ============================================================
 
@@ -513,6 +560,7 @@ paths:
   captures: "captures"
   raw_captures: "captures/raw"
   tag_captures: "captures/tags"
+  enhanced_captures: "captures/enhanced"
   barcode_captures: "captures/barcode"
   ocr_captures: "captures/ocr"
 

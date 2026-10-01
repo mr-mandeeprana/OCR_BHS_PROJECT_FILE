@@ -99,6 +99,7 @@ from app.pipeline.processing_queue import (
 from app.pipeline.worker_manager import WorkerManager
 from app.pipeline.result_manager import ResultManager
 from app.pipeline.best_frame_selector import BestFrameSelector
+from app.pipeline.image_evidence_store import ImageEvidenceStore
 
 
 # ============================================================================
@@ -258,6 +259,22 @@ class OCRBHSPipeline:
         )
 
         self.image_quality = ImageQualityChecker()
+
+        # --------------------------------------------------------------------
+        # Image evidence saving (config: image_saving.*)
+        #
+        # Independent from ocr.enabled / barcode.enabled. Writes happen on a
+        # background thread; image_saving.enabled=false turns it all off.
+        # --------------------------------------------------------------------
+
+        self.image_evidence = ImageEvidenceStore(
+            config=self.config,
+            camera_id=self.camera_id,
+        )
+
+        # Single-slot cache so OCR + barcode submission for the same
+        # track/frame only run TagProcessor.normalize() once.
+        self._prepared_cache: Optional[Tuple[Any, ...]] = None
 
         # --------------------------------------------------------------------
         # Best-frame selectors
@@ -1684,6 +1701,89 @@ class OCRBHSPipeline:
             return selector
 
     # ========================================================================
+    # PREPARE PROCESSING FRAME (raw tag -> enhanced tag)
+    # ========================================================================
+
+    def _prepare_processing_frame(
+        self,
+        key: Any,
+        frame_id: int,
+        candidate_frame: Optional[np.ndarray],
+        already_enhanced: bool = False,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Returns (raw_tag, enhanced_tag).
+
+        candidate_frame is the IATA tag crop chosen by BestFrameSelector.
+        enhanced_tag (TagProcessor.normalize) is what OCR/barcode receive.
+
+        already_enhanced=True is used for the fallback crop, which came out
+        of TagProcessor.process_detection() and was therefore normalized
+        already - it is not enhanced a second time.
+        """
+
+        if candidate_frame is None:
+
+            return None, None
+
+        cache_key = (
+            key,
+            int(frame_id),
+            bool(already_enhanced),
+            id(candidate_frame),
+        )
+
+        cached = self._prepared_cache
+
+        if cached is not None and cached[0] == cache_key:
+
+            return cached[1].copy(), cached[2].copy()
+
+        try:
+
+            raw_tag = candidate_frame.copy()
+
+            if already_enhanced:
+
+                enhanced_tag = raw_tag.copy()
+
+            else:
+
+                enhanced_tag = self.tag_processor.normalize(
+                    raw_tag
+                )
+
+                if enhanced_tag is None:
+
+                    enhanced_tag = raw_tag.copy()
+
+        except Exception as exc:
+
+            print(
+                "[PIPELINE] Tag enhancement error "
+                f"camera={self.camera_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            try:
+
+                raw_tag = candidate_frame.copy()
+
+                enhanced_tag = candidate_frame.copy()
+
+            except Exception:
+
+                return None, None
+
+        self._prepared_cache = (
+            cache_key,
+            raw_tag,
+            enhanced_tag,
+        )
+
+        return raw_tag.copy(), enhanced_tag.copy()
+
+    # ========================================================================
     # BEST FRAME CANDIDATE
     # ========================================================================
 
@@ -2101,8 +2201,23 @@ class OCRBHSPipeline:
         # image.
         # ----------------------------------------------------------------
 
+        raw_tag, processing_frame = (
+            self._prepare_processing_frame(
+                key=key,
+                frame_id=candidate_frame_id,
+                candidate_frame=candidate_frame,
+                already_enhanced=(
+                    candidate_frame is safe_fallback
+                ),
+            )
+        )
+
+        if processing_frame is None:
+
+            return False
+
         if not self._quality_gate(
-            candidate_frame
+            processing_frame
         ):
 
             return False
@@ -2120,7 +2235,7 @@ class OCRBHSPipeline:
             camera_id=self.camera_id,
             track_id=key[1],
             frame=self._safe_frame_copy(
-                candidate_frame
+                processing_frame
             ),
             timestamp=float(
                 candidate_timestamp
@@ -2176,6 +2291,15 @@ class OCRBHSPipeline:
             self.ocr_jobs_failed += 1
 
             return False
+
+        self.image_evidence.save_processing_images(
+            raw_tag=raw_tag,
+            enhanced_tag=processing_frame,
+            processing_frame=task.frame,
+            stage="ocr",
+            frame_id=int(candidate_frame_id),
+            track_id=int(key[1]),
+        )
 
         self.ocr_jobs_submitted += 1
 
@@ -2274,8 +2398,23 @@ class OCRBHSPipeline:
         # image.
         # ----------------------------------------------------------------
 
+        raw_tag, processing_frame = (
+            self._prepare_processing_frame(
+                key=key,
+                frame_id=candidate_frame_id,
+                candidate_frame=candidate_frame,
+                already_enhanced=(
+                    candidate_frame is safe_fallback
+                ),
+            )
+        )
+
+        if processing_frame is None:
+
+            return False
+
         if not self._quality_gate(
-            candidate_frame
+            processing_frame
         ):
 
             return False
@@ -2293,7 +2432,7 @@ class OCRBHSPipeline:
             camera_id=self.camera_id,
             track_id=key[1],
             frame=self._safe_frame_copy(
-                candidate_frame
+                processing_frame
             ),
             timestamp=float(
                 candidate_timestamp
@@ -2349,6 +2488,15 @@ class OCRBHSPipeline:
             self.barcode_jobs_failed += 1
 
             return False
+
+        self.image_evidence.save_processing_images(
+            raw_tag=raw_tag,
+            enhanced_tag=processing_frame,
+            processing_frame=task.frame,
+            stage="barcode",
+            frame_id=int(candidate_frame_id),
+            track_id=int(key[1]),
+        )
 
         self.barcode_jobs_submitted += 1
 
@@ -3376,6 +3524,18 @@ class OCRBHSPipeline:
 
             print(
                 "[PIPELINE] Worker stop warning: "
+                f"{exc}"
+            )
+
+        # --------------------------------------------------------------------
+        # Flush pending image evidence writes
+        # --------------------------------------------------------------------
+
+        try:
+            self.image_evidence.close()
+        except Exception as exc:
+            print(
+                "[PIPELINE] Image evidence stop warning: "
                 f"{exc}"
             )
 
